@@ -179,10 +179,30 @@ class oproj_RowParallelLinear(LinearBase):
         bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
         output_parallel = self.quant_method.apply(
             self, all_to_all_result, bias=bias_)
+        
+        # perform reduce_scatter with uneven tensor sizes 
+        # by padding them to equal size before communication
+        otp_group_max_batchsize = max(otp_group_batchsize)
+        def pad_tensor(tensor: torch.Tensor, target_size: int, dim: int = 0, value=0.0):
+            pad_size = target_size - tensor.size(dim)
+            if pad_size <= 0:
+                return tensor
+            pad_shape = list(tensor.shape)
+            pad_shape[dim] = pad_size
+            padding = torch.full(
+                    pad_shape, 
+                    fill_value=value, 
+                    dtype=tensor.dtype, 
+                    device=tensor.device)
+
+            return torch.cat([tensor, padding], dim=dim)
+
+        def unpad_tensor(tensor: torch.Tensor, original_size: int, dim: int = 0):
+            return tensor.narrow(dim, 0, original_size)
 
         # prepare all-reduce data
         final_result = torch.empty(
-                otp_group_batchsize[self.tp_rank], 
+                otp_group_max_batchsize, 
                 output_parallel.size(1), 
                 dtype=output_parallel.dtype, 
                 device=output_parallel.device)
@@ -191,6 +211,7 @@ class oproj_RowParallelLinear(LinearBase):
         start_idx = 0
         for size in otp_group_batchsize:
             chunk = output_parallel[start_idx:start_idx + size, :]
+            chunk = pad_tensor(chunk, otp_group_max_batchsize)
             recv_chunks.append(chunk.contiguous())
             start_idx += size
         
@@ -200,6 +221,9 @@ class oproj_RowParallelLinear(LinearBase):
                 recv_chunks, 
                 op=dist.ReduceOp.SUM, 
                 group=get_otp_group().device_group)
+        
+        # unpad result
+        final_result = unpad_tensor(final_result, otp_group_batchsize[self.tp_rank])
 
         # Handle bias return based on configuration
         output_bias = self.bias if self.skip_bias_add else None
