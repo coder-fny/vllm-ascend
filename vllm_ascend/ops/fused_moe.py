@@ -43,6 +43,7 @@ import vllm_ascend.envs as envs_ascend
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import FusedMoEState
 from vllm_ascend.distributed.parallel_state import get_mc2_group
+from vllm_ascend.multistream.context import get_multistream_comm_context
 from vllm_ascend.ops.expert_load_balancer import ExpertLoadBalancer
 from vllm_ascend.ops.moe_dispatcher.token_dispatcher import (
     MoEAlltoAllSeqOverLapDispatcher, MoEDispatcherConfig)
@@ -158,51 +159,70 @@ def fused_experts_with_mc2(
         Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]: Output tensor(s)
     """
 
-    # NOTE: `global_bs` should be equal to `max_num_tokens_across_dp` * `ep_world_size`,
-    # and `max_num_tokens_across_dp` has been split into `tp_world_size` parts before.
-    def _calculate_global_bs(tp_size: int, ep_size: int) -> int:
-        """Calculate global batch size for MoE distribution"""
-        max_tokens_dp = get_forward_context().max_tokens_across_dp
-        return math.ceil(max_tokens_dp / tp_size) * ep_size
+    def _build_context() -> dict:
+        ep_group = get_mc2_group()
+        tp_group = get_tp_group()
+        forward_ctx = get_forward_context()
+        soc_version = get_ascend_soc_version()
 
+        return {
+            # 基础配置
+            'expert_map': expert_map,
+            'moe_all_to_all_group_name': moe_all_to_all_group_name,
+            'is_torchair': is_torchair,
+            'mc2_mask': mc2_mask,
+
+            'ep_group': ep_group,
+            'ep_rank_id': ep_group.rank_in_group,
+            'ep_world_size': ep_group.world_size,
+            'tp_world_size': tp_group.world_size,
+
+            # NOTE: `global_bs` should be equal to `max_num_tokens_across_dp` * `ep_world_size`,
+            # and `max_num_tokens_across_dp` has been split into `tp_world_size` parts before.
+            'global_bs': math.ceil(forward_ctx.max_tokens_across_dp / tp_group.world_size) * ep_group.world_size,
+            'moe_expert_num': len(expert_map),
+
+            # 功能开关
+            # NOTE: Currently, when in A3, we need to pass in some extra param into dispatch & combine
+            # NOTE: Currently, when in A3 or in torchair graph, we need to pass in some extra param into dispatch & combine
+            'dual_move_enabled': get_ascend_config().fc_dual_batch,
+            'enable_dispatch_v2': hasattr(torch_npu, "npu_moe_distribute_dispatch_v2"),
+            'a3_enabled': soc_version == AscendSocVersion.A3,
+            'need_extra_params': (soc_version == AscendSocVersion.A3) or is_torchair,
+
+            # 流控制
+            'ms_metadata': get_multistream_comm_context(),
+        }
     def _build_dispatch_kwargs(
-            enable_v2: bool,
-            need_extra: bool,
-            a3: bool,
-            mc2_mask: Optional[torch.Tensor],
-            x: torch.Tensor,
-            expert_ids: torch.Tensor,
-            moe_expert_num: int,
-            moe_all_to_all_group_name: Optional[str],
-            ep_world_size: int,
-            ep_rank_id: int,
-            global_bs: int
+            hidden_states: torch.Tensor,
+            topk_ids: torch.Tensor,
+            ctx: dict
     ) -> dict:
         quant_mode = 0
         """Construct kwargs for MoE dispatch operation"""
         base_kwargs = {
-            "x": x,
-            "expert_ids": expert_ids,
+            "x": hidden_states,
+            "expert_ids": topk_ids,
             "expert_shard_type": 0,
             "shared_expert_rank_num": 0,
-            "moe_expert_num": moe_expert_num,
-            "global_bs": global_bs,
+            "moe_expert_num": ctx['moe_expert_num'],
+            "global_bs": ctx['global_bs'],
             "scales": None,
             "quant_mode": quant_mode,
-            "group_ep": moe_all_to_all_group_name,
-            "ep_world_size": ep_world_size,
-            "ep_rank_id": ep_rank_id,
+            "group_ep": ctx['moe_all_to_all_group_name'],
+            "ep_world_size": ctx['ep_world_size'],
+            "ep_rank_id": ctx['ep_rank_id'],
         }
 
-        if need_extra:
+        if ctx['need_extra_params']:
             base_kwargs.update({
-                "group_tp": moe_all_to_all_group_name,
+                "group_tp": ctx['moe_all_to_all_group_name'],
                 "tp_world_size": 1,
                 "tp_rank_id": 0,
             })
 
-        if a3 and enable_v2:
-            base_kwargs["x_active_mask"] = mc2_mask
+        if ctx['a3_enabled'] and ctx['enable_dispatch_v2']:
+            base_kwargs["x_active_mask"] = ctx['mc2_mask']
 
         return base_kwargs
 
@@ -255,51 +275,43 @@ def fused_experts_with_mc2(
         return torch.cat(down_list, dim=0)
 
     def _build_combine_kwargs(
-            enable_v2: bool,
-            need_extra: bool,
-            a3: bool,
-            mc2_mask: Optional[torch.Tensor],
-            x: torch.Tensor,
             topk_ids: torch.Tensor,
             topk_weights: torch.Tensor,
-            moe_expert_num: int,
-            group_name: Optional[str],
-            ep_world_size: int,
-            ep_rank_id: int,
+            down_out: torch.Tensor,
             ep_recv_counts: torch.Tensor,
             tp_recv_counts: torch.Tensor,
             assist_info: Any,
-            global_bs: int
+            ctx: dict
     ) -> dict:
         """Construct kwargs for MoE combine operation"""
         base_kwargs = {
-            "expand_x": x,
+            "expand_x": down_out,
             "expert_ids": topk_ids,
             "expert_scales": topk_weights.to(torch.float32),
             "expert_shard_type": 0,
             "shared_expert_rank_num": 0,
-            "moe_expert_num": moe_expert_num,
-            "global_bs": global_bs,
+            "moe_expert_num": ctx['moe_expert_num'],
+            "global_bs": ctx['global_bs'],
             "ep_send_counts": ep_recv_counts,
-            "group_ep": group_name,
-            "ep_world_size": ep_world_size,
-            "ep_rank_id": ep_rank_id,
+            "group_ep": ctx['moe_all_to_all_group_name'],
+            "ep_world_size": ctx['ep_world_size'],
+            "ep_rank_id": ctx['ep_rank_id'],
         }
 
-        if enable_v2:
+        if ctx['enable_dispatch_v2']:
             base_kwargs["assist_info_for_combine"] = assist_info
         else:
             base_kwargs["expand_idx"] = assist_info
 
-        if need_extra:
+        if ctx['need_extra_params']:
             base_kwargs.update({
                 "tp_send_counts": tp_recv_counts,
-                "group_tp": group_name,
+                "group_tp": ctx['moe_all_to_all_group_name'],
                 "tp_world_size": 1,
                 "tp_rank_id": 0,
             })
-        if a3 and enable_v2:
-            base_kwargs["x_active_mask"] = mc2_mask
+        if ctx['a3_enabled'] and ctx['enable_dispatch_v2']:
+            base_kwargs["x_active_mask"] = ctx['mc2_mask']
 
         return base_kwargs
 
@@ -318,97 +330,84 @@ def fused_experts_with_mc2(
             shared_hidden_states, _ = shared_experts.down_proj(shared_act)
         return hidden_states, shared_hidden_states
 
-    # 1. Configuration setup
-    ep_group = get_mc2_group()
-    ep_rank_id = ep_group.rank_in_group
-    ep_world_size = ep_group.world_size
-    tp_world_size = get_tp_group().world_size
-    moe_expert_num = len(expert_map)
+    def _get_dispatch_func(ctx: dict):
+        if ctx['enable_dispatch_v2']:
+            return torch_npu.npu_moe_distribute_dispatch_v2
+        else:
+            return torch_npu.npu_moe_distribute_dispatch
 
-    # 2. Global batch size calculation
-    global_bs = _calculate_global_bs(tp_world_size, ep_world_size)
+    def _get_combine_func(ctx: dict):
+        if ctx['enable_dispatch_v2']:
+            return torch_npu.npu_moe_distribute_combine_v2
+        else:
+            return torch_npu.npu_moe_distribute_combine
 
-    # 3. Environment flags
-    # NOTE: Currently, when in A3, we need to pass in some extra param into dispatch & combine
-    # NOTE: Currently, when in A3 or in torchair graph, we need to pass in some extra param into dispatch & combine
-    a3_enabled = get_ascend_soc_version() == AscendSocVersion.A3
-    need_extra_params = a3_enabled or is_torchair
-    enable_dispatch_v2 = hasattr(torch_npu, "npu_moe_distribute_dispatch_v2")
-
-    # 4. MoE dispatch phase
-    dispatch_kwargs = _build_dispatch_kwargs(
-        enable_v2=enable_dispatch_v2,
-        need_extra=need_extra_params,
-        a3=a3_enabled,
-        mc2_mask=mc2_mask,
-        x=hidden_states,
-        expert_ids=topk_ids,
-        moe_expert_num=moe_expert_num,
-        moe_all_to_all_group_name=moe_all_to_all_group_name,
-        ep_world_size=ep_world_size,
-        ep_rank_id=ep_rank_id,
-        global_bs=global_bs
-    )
-
-    dispatch_func = (
-        torch_npu.npu_moe_distribute_dispatch_v2
-        if enable_dispatch_v2
-        else torch_npu.npu_moe_distribute_dispatch
-    )
-    dispatch_output = dispatch_func(**dispatch_kwargs)
-    expand_x, _, assist_info, expert_token_nums, ep_recv_counts = dispatch_output[:5]
-
-    # 5. Shared experts computation (if any)
-    shared_act = None
-    if shared_experts is not None:
-        shared_act = _process_shared_experts(
-            experts=shared_experts,
-            h_states=hidden_states,
-            weights=topk_weights,
-            expand_x=expand_x
+    def _single_stream_execution(
+            ctx: dict,
+            hidden_states: torch.Tensor,
+            topk_ids: torch.Tensor,
+            topk_weights: torch.Tensor,
+            w1: torch.Tensor,
+            w2: torch.Tensor,
+            shared_experts: Optional[Any] = None
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        # MoE dispatch phase
+        dispatch_kwargs = _build_dispatch_kwargs(hidden_states,topk_ids, ctx)
+        dispatch_output = _get_dispatch_func(ctx)(**dispatch_kwargs)
+        expand_x, _, assist_info, expert_token_nums, ep_recv_counts = dispatch_output[:5]
+        # Shared experts computation (if any)
+        shared_act = None
+        if shared_experts is not None:
+            shared_act = _process_shared_experts(
+                experts=shared_experts,
+                h_states=hidden_states,
+                weights=topk_weights,
+                expand_x=expand_x
+            )
+        # Expert forward computation
+        down_out = _expert_forward(
+            expand_x=expand_x,
+            w1=w1,
+            w2=w2,
+            expert_token_nums=expert_token_nums
+        )
+        # MoE combine phase
+        combine_kwargs = _build_combine_kwargs(
+            topk_ids=topk_ids,
+            topk_weights=topk_weights,
+            down_out=down_out,
+            ep_recv_counts=ep_recv_counts,
+            tp_recv_counts=dispatch_output[5],
+            assist_info=assist_info,
+            ctx=ctx
+        )
+        hidden_states = _get_combine_func(ctx)(**combine_kwargs)
+        # Final output preparation
+        return _prepare_return(
+            hidden_states=hidden_states,
+            shared_experts=shared_experts,
+            shared_act=shared_act,
+            down_out_list=down_out
         )
 
-    # 6. Expert forward computation
-    down_out = _expert_forward(
-        expand_x=expand_x,
-        w1=w1,
-        w2=w2,
-        expert_token_nums=expert_token_nums
-    )
+    ctx = _build_context()
 
-    # 7. MoE combine phase
-    combine_kwargs = _build_combine_kwargs(
-        enable_v2=enable_dispatch_v2,
-        need_extra=need_extra_params,
-        a3=a3_enabled,
-        mc2_mask=mc2_mask,
-        x=down_out,
-        topk_ids=topk_ids,
-        topk_weights=topk_weights,
-        moe_expert_num=moe_expert_num,
-        group_name=moe_all_to_all_group_name,
-        ep_world_size=ep_world_size,
-        ep_rank_id=ep_rank_id,
-        ep_recv_counts=ep_recv_counts,
-        tp_recv_counts=dispatch_output[5],
-        assist_info=assist_info,
-        global_bs=global_bs
-    )
+    # 双流模式启用条件：配置开启且无共享专家且元数据可用
+    use_dual_stream = (get_ascend_config().fc_dual_batch and
+                       ctx['ms_metadata'] is not None and
+                       shared_experts is None)
 
-    combine_func = (
-        torch_npu.npu_moe_distribute_combine_v2
-        if enable_dispatch_v2
-        else torch_npu.npu_moe_distribute_combine
-    )
-    hidden_states = combine_func(**combine_kwargs)
-
-    # 8. Final output preparation
-    return _prepare_return(
-        hidden_states=hidden_states,
-        shared_experts=shared_experts,
-        shared_act=shared_act,
-        down_out_list=down_out
-    )
+    if use_dual_stream:
+        return _dual_stream_execution()
+    else:
+        return _single_stream_execution(
+            ctx=ctx,
+            hidden_states=hidden_states,
+            topk_ids=topk_ids,
+            topk_weights=topk_weights,
+            w1=w1,
+            w2=w2,
+            shared_experts=shared_experts)
 
 def apply_mlp(
     hidden_states: torch.Tensor,
