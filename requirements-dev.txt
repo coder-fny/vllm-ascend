@@ -1,0 +1,16 @@
+-r requirements-lint.txt
+-r requirements.txt
+modelscope
+openai
+pytest >= 6.0
+pytest-asyncio
+pytest-mock
+lm-eval
+ray
+types-jsonschema
+xgrammar
+zmq
+types-psutil
+pytest-cov
+regex
+sentence_transformers
