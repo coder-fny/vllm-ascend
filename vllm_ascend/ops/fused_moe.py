@@ -406,29 +406,14 @@ def fused_experts_with_mc2(
         expert_groupB_size = moe_expert_num - split_idx
 
         # 专家权重切分
-        w1_groupA = w1[:split_idx]
-        w1_groupB = w1[split_idx:]
-        w2_groupA = w2[:split_idx]
-        w2_groupB = w2[split_idx:]
-
-        # 流A维持原始topk_ids
-        topk_ids_A = topk_ids
-
-        # 流B重映射专家ID：将原始ID [expert_groupA_size, moe_expert_num-1] 映射到 [0, expert_groupB_size-1]
-        # 将 [0, expert_groupA_size-1] 映射到无效值 -1
-        topk_ids_B = topk_ids.clone()
-        # 创建掩码：标识哪些token分配给专家组B
-        maskB = (topk_ids_B >= expert_groupA_size) & (topk_ids_B < moe_expert_num)
-        # 重映射专家ID
-        topk_ids_B[maskB] = topk_ids_B[maskB] - expert_groupA_size
-        # 将不属于专家组B的分配标记为无效
-        topk_ids_B[~maskB] = -1
+        topk_ids_A = topk_ids[:split_idx]
+        topk_ids_B = topk_ids[split_idx:]
+        topk_weights_A = topk_weights[:split_idx]
+        topk_weights_B = topk_weights[split_idx:]
 
         # 阶段1: 权重转置（主线程准备）
-        w1_t_A = w1_groupA.transpose(1, 2)
-        w2_t_A = w2_groupA.transpose(1, 2)
-        w1_t_B = w1_groupB.transpose(1, 2)
-        w2_t_B = w2_groupB.transpose(1, 2)
+        w1_t = w1.transpose(1, 2)
+        w2_t = w2.transpose(1, 2)
 
         # 阶段2: 流A执行Dispatch A
         with torch_npu.npu.npu_stream_switch("streamA", 0):
@@ -442,7 +427,7 @@ def fused_experts_with_mc2(
         with torch_npu.npu.npu_stream_switch("streamA", 0):
             # 确保Dispatch A完成
             torch_npu.npu.npu_wait_tensor(down_outA, expand_xA)
-            down_outA = _expert_forward(expand_xA, w1_t_A, w2_t_A, expert_tokensA)
+            down_outA = _expert_forward(expand_xA, w1_t, w2_t, expert_tokensA)
 
         # 流B: Dispatch B（依赖Dispatch A完成）
         dispatchB_result = None
@@ -459,7 +444,7 @@ def fused_experts_with_mc2(
         with torch_npu.npu.npu_stream_switch("streamA", 0):
             # 确保Compute A完成
             torch_npu.npu.npu_wait_tensor(resultA, down_outA)
-            kwargs = _build_combine_kwargs(topk_ids_A, topk_weights, expert_groupA_size, down_outA, ep_recvA, dispatchA_result[5], assist_infoA, ctx)
+            kwargs = _build_combine_kwargs(topk_ids_A, topk_weights_A, expert_groupA_size, down_outA, ep_recvA, dispatchA_result[5], assist_infoA, ctx)
             resultA = _get_combine_func(ctx)(**kwargs)
 
         # 流B: Compute B（依赖Dispatch B完成）
@@ -467,14 +452,14 @@ def fused_experts_with_mc2(
         with torch_npu.npu.npu_stream_switch("streamB", 0):
             # 确保Dispatch B完成
             torch_npu.npu.npu_wait_tensor(down_outB, expand_xB)
-            down_outB = _expert_forward(expand_xB, w1_t_B, w2_t_B, expert_tokensB)
+            down_outB = _expert_forward(expand_xB, w1_t, w2_t, expert_tokensB)
 
         # 阶段5: 流B执行Combine B（依赖Compute B完成）
         resultB = None
         with torch_npu.npu.npu_stream_switch("streamB", 0):
             # 确保Compute B完成
             torch_npu.npu.npu_wait_tensor(resultB, down_outB)
-            kwargs = _build_combine_kwargs(topk_ids_B, topk_weights, expert_groupB_size, down_outB, ep_recvB, dispatchB_result[5],  assist_infoB)
+            kwargs = _build_combine_kwargs(topk_ids_B, topk_weights_B, expert_groupB_size, down_outB, ep_recvB, dispatchB_result[5],  assist_infoB)
             resultB = _get_combine_func(ctx)(**kwargs)
 
         # 合并结果
