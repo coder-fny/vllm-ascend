@@ -43,7 +43,6 @@ import vllm_ascend.envs as envs_ascend
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import FusedMoEState
 from vllm_ascend.distributed.parallel_state import get_mc2_group
-from vllm_ascend.multistream.context import get_multistream_comm_context
 from vllm_ascend.ops.expert_load_balancer import ExpertLoadBalancer
 from vllm_ascend.ops.moe_dispatcher.token_dispatcher import (
     MoEAlltoAllSeqOverLapDispatcher, MoEDispatcherConfig)
@@ -180,7 +179,6 @@ def fused_experts_with_mc2(
             # NOTE: `global_bs` should be equal to `max_num_tokens_across_dp` * `ep_world_size`,
             # and `max_num_tokens_across_dp` has been split into `tp_world_size` parts before.
             'global_bs': math.ceil(forward_ctx.max_tokens_across_dp / tp_group.world_size) * ep_group.world_size,
-            'moe_expert_num': len(expert_map),
 
             # 功能开关
             # NOTE: Currently, when in A3, we need to pass in some extra param into dispatch & combine
@@ -189,42 +187,7 @@ def fused_experts_with_mc2(
             'enable_dispatch_v2': hasattr(torch_npu, "npu_moe_distribute_dispatch_v2"),
             'a3_enabled': soc_version == AscendSocVersion.A3,
             'need_extra_params': (soc_version == AscendSocVersion.A3) or is_torchair,
-
-            # 流控制
-            'ms_metadata': get_multistream_comm_context(),
         }
-    def _build_dispatch_kwargs(
-            hidden_states: torch.Tensor,
-            topk_ids: torch.Tensor,
-            ctx: dict
-    ) -> dict:
-        quant_mode = 0
-        """Construct kwargs for MoE dispatch operation"""
-        base_kwargs = {
-            "x": hidden_states,
-            "expert_ids": topk_ids,
-            "expert_shard_type": 0,
-            "shared_expert_rank_num": 0,
-            "moe_expert_num": ctx['moe_expert_num'],
-            "global_bs": ctx['global_bs'],
-            "scales": None,
-            "quant_mode": quant_mode,
-            "group_ep": ctx['moe_all_to_all_group_name'],
-            "ep_world_size": ctx['ep_world_size'],
-            "ep_rank_id": ctx['ep_rank_id'],
-        }
-
-        if ctx['need_extra_params']:
-            base_kwargs.update({
-                "group_tp": ctx['moe_all_to_all_group_name'],
-                "tp_world_size": 1,
-                "tp_rank_id": 0,
-            })
-
-        if ctx['a3_enabled'] and ctx['enable_dispatch_v2']:
-            base_kwargs["x_active_mask"] = ctx['mc2_mask']
-
-        return base_kwargs
 
     def _process_shared_experts(
             experts: Any,
@@ -247,7 +210,6 @@ def fused_experts_with_mc2(
     ) -> torch.Tensor:
         """Execute expert forward computation (gate_up -> SwiGLU -> down)"""
         # Gate-up projection
-        w1 = w1.transpose(1, 2)
         group_list = expert_token_nums.to(torch.int64)
         gate_up_out_list = torch_npu.npu_grouped_matmul(
             x=[expand_x],
@@ -263,7 +225,6 @@ def fused_experts_with_mc2(
         gate_up_out = torch_npu.npu_swiglu(gate_up_out)
 
         # Down projection
-        w2 = w2.transpose(1, 2)
         down_list = torch_npu.npu_grouped_matmul(
             x=[gate_up_out],
             weight=[w2],
@@ -274,9 +235,44 @@ def fused_experts_with_mc2(
         )
         return torch.cat(down_list, dim=0)
 
+    def _build_dispatch_kwargs(
+            hidden_states: torch.Tensor,
+            topk_ids: torch.Tensor,
+            moe_expert_num: int,
+            ctx: dict
+    ) -> dict:
+        quant_mode = 0
+        """Construct kwargs for MoE dispatch operation"""
+        base_kwargs = {
+            "x": hidden_states,
+            "expert_ids": topk_ids,
+            "expert_shard_type": 0,
+            "shared_expert_rank_num": 0,
+            "moe_expert_num": moe_expert_num,
+            "global_bs": ctx['global_bs'],
+            "scales": None,
+            "quant_mode": quant_mode,
+            "group_ep": ctx['moe_all_to_all_group_name'],
+            "ep_world_size": ctx['ep_world_size'],
+            "ep_rank_id": ctx['ep_rank_id'],
+        }
+
+        if ctx['need_extra_params']:
+            base_kwargs.update({
+                "group_tp": ctx['moe_all_to_all_group_name'],
+                "tp_world_size": 1,
+                "tp_rank_id": 0,
+            })
+
+        if ctx['a3_enabled'] and ctx['enable_dispatch_v2']:
+            base_kwargs["x_active_mask"] = ctx['mc2_mask']
+
+        return base_kwargs
+
     def _build_combine_kwargs(
             topk_ids: torch.Tensor,
             topk_weights: torch.Tensor,
+            moe_expert_num: int,
             down_out: torch.Tensor,
             ep_recv_counts: torch.Tensor,
             tp_recv_counts: torch.Tensor,
@@ -290,7 +286,7 @@ def fused_experts_with_mc2(
             "expert_scales": topk_weights.to(torch.float32),
             "expert_shard_type": 0,
             "shared_expert_rank_num": 0,
-            "moe_expert_num": ctx['moe_expert_num'],
+            "moe_expert_num": moe_expert_num,
             "global_bs": ctx['global_bs'],
             "ep_send_counts": ep_recv_counts,
             "group_ep": ctx['moe_all_to_all_group_name'],
@@ -349,10 +345,11 @@ def fused_experts_with_mc2(
             topk_weights: torch.Tensor,
             w1: torch.Tensor,
             w2: torch.Tensor,
+            moe_expert_num: int,
             shared_experts: Optional[Any] = None
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         # MoE dispatch phase
-        dispatch_kwargs = _build_dispatch_kwargs(hidden_states,topk_ids, ctx)
+        dispatch_kwargs = _build_dispatch_kwargs(hidden_states,topk_ids, moe_expert_num, ctx)
         dispatch_output = _get_dispatch_func(ctx)(**dispatch_kwargs)
         expand_x, _, assist_info, expert_token_nums, ep_recv_counts = dispatch_output[:5]
         # Shared experts computation (if any)
@@ -365,16 +362,19 @@ def fused_experts_with_mc2(
                 expand_x=expand_x
             )
         # Expert forward computation
+        w1_t = w1.transpose(1, 2)
+        w2_t = w2.transpose(1, 2)
         down_out = _expert_forward(
             expand_x=expand_x,
-            w1=w1,
-            w2=w2,
+            w1=w1_t,
+            w2=w2_t,
             expert_token_nums=expert_token_nums
         )
         # MoE combine phase
         combine_kwargs = _build_combine_kwargs(
             topk_ids=topk_ids,
             topk_weights=topk_weights,
+            moe_expert_num=moe_expert_num,
             down_out=down_out,
             ep_recv_counts=ep_recv_counts,
             tp_recv_counts=dispatch_output[5],
@@ -390,15 +390,112 @@ def fused_experts_with_mc2(
             down_out_list=down_out
         )
 
+    def _dual_stream_execution(
+        ctx: dict,
+        hidden_states: torch.Tensor,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+        moe_expert_num: int,
+        w1: torch.Tensor,
+        w2: torch.Tensor
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        """双流并行执行路径（无共享专家）"""
+        # 专家分组（关键：专家索引切分）
+        split_idx = moe_expert_num // 2
+        expert_groupA_size = split_idx
+        expert_groupB_size = moe_expert_num - split_idx
+
+        # 专家权重切分
+        w1_groupA = w1[:split_idx]
+        w1_groupB = w1[split_idx:]
+        w2_groupA = w2[:split_idx]
+        w2_groupB = w2[split_idx:]
+
+        # 流A维持原始topk_ids
+        topk_ids_A = topk_ids
+
+        # 流B重映射专家ID：将原始ID [expert_groupA_size, moe_expert_num-1] 映射到 [0, expert_groupB_size-1]
+        # 将 [0, expert_groupA_size-1] 映射到无效值 -1
+        topk_ids_B = topk_ids.clone()
+        # 创建掩码：标识哪些token分配给专家组B
+        maskB = (topk_ids_B >= expert_groupA_size) & (topk_ids_B < moe_expert_num)
+        # 重映射专家ID
+        topk_ids_B[maskB] = topk_ids_B[maskB] - expert_groupA_size
+        # 将不属于专家组B的分配标记为无效
+        topk_ids_B[~maskB] = -1
+
+        # 阶段1: 权重转置（主线程准备）
+        w1_t_A = w1_groupA.transpose(1, 2)
+        w2_t_A = w2_groupA.transpose(1, 2)
+        w1_t_B = w1_groupB.transpose(1, 2)
+        w2_t_B = w2_groupB.transpose(1, 2)
+
+        # 阶段2: 流A执行Dispatch A
+        with torch_npu.npu.npu_stream_switch("streamA", 0):
+            kwargs = _build_dispatch_kwargs(hidden_states,topk_ids_A, expert_groupA_size, ctx)
+            dispatchA_result = _get_dispatch_func(ctx)(**kwargs)
+            expand_xA, _, assist_infoA, expert_tokensA, ep_recvA = dispatchA_result[:5]
+
+        # 阶段3: 流A执行Compute A + 流B执行Dispatch B（并行）
+        # 流A: Compute A
+        down_outA = None
+        with torch_npu.npu.npu_stream_switch("streamA", 0):
+            # 确保Dispatch A完成
+            torch_npu.npu.npu_wait_tensor(down_outA, expand_xA)
+            down_outA = _expert_forward(expand_xA, w1_t_A, w2_t_A, expert_tokensA)
+
+        # 流B: Dispatch B（依赖Dispatch A完成）
+        dispatchB_result = None
+        with torch_npu.npu.npu_stream_switch("streamB", 0):
+            # 等待Dispatch A完成
+            torch_npu.npu.npu_wait_tensor(dispatchB_result, expand_xA)
+            kwargs = _build_dispatch_kwargs(hidden_states,topk_ids_B, expert_groupB_size, ctx)
+            dispatchB_result = _get_dispatch_func(ctx)(**kwargs)
+            expand_xB, _, assist_infoB, expert_tokensB, ep_recvB = dispatchB_result[:5]
+
+        # 阶段4: 流A执行Combine A + 流B执行Compute B（并行）
+        # 流A: Combine A（依赖Compute A完成）
+        resultA = None
+        with torch_npu.npu.npu_stream_switch("streamA", 0):
+            # 确保Compute A完成
+            torch_npu.npu.npu_wait_tensor(resultA, down_outA)
+            kwargs = _build_combine_kwargs(topk_ids_A, topk_weights, expert_groupA_size, down_outA, ep_recvA, dispatchA_result[5], assist_infoA, ctx)
+            resultA = _get_combine_func(ctx)(**kwargs)
+
+        # 流B: Compute B（依赖Dispatch B完成）
+        down_outB = None
+        with torch_npu.npu.npu_stream_switch("streamB", 0):
+            # 确保Dispatch B完成
+            torch_npu.npu.npu_wait_tensor(down_outB, expand_xB)
+            down_outB = _expert_forward(expand_xB, w1_t_B, w2_t_B, expert_tokensB)
+
+        # 阶段5: 流B执行Combine B（依赖Compute B完成）
+        resultB = None
+        with torch_npu.npu.npu_stream_switch("streamB", 0):
+            # 确保Compute B完成
+            torch_npu.npu.npu_wait_tensor(resultB, down_outB)
+            kwargs = _build_combine_kwargs(topk_ids_B, topk_weights, expert_groupB_size, down_outB, ep_recvB, dispatchB_result[5],  assist_infoB)
+            resultB = _get_combine_func(ctx)(**kwargs)
+
+        # 合并结果
+        torch_npu.npu.npu_wait_tensor(resultA, resultB)
+        return resultA + resultB
+
     ctx = _build_context()
 
     # 双流模式启用条件：配置开启且无共享专家且元数据可用
     use_dual_stream = (get_ascend_config().fc_dual_batch and
-                       ctx['ms_metadata'] is not None and
                        shared_experts is None)
 
     if use_dual_stream:
-        return _dual_stream_execution()
+        return _dual_stream_execution(
+            ctx=ctx,
+            hidden_states=hidden_states,
+            topk_ids=topk_ids,
+            topk_weights=topk_weights,
+            moe_expert_num=len(expert_map),
+            w1=w1,
+            w2=w2)
     else:
         return _single_stream_execution(
             ctx=ctx,
@@ -407,6 +504,7 @@ def fused_experts_with_mc2(
             topk_weights=topk_weights,
             w1=w1,
             w2=w2,
+            moe_expert_num=len(expert_map),
             shared_experts=shared_experts)
 
 def apply_mlp(
