@@ -254,6 +254,7 @@ class NPUWorker(WorkerBase):
 
     def _init_worker_distributed_environment(self) -> None:
         """Initialize the distributed environment."""
+        additional_config = self.vllm_config.additional_config
         set_custom_all_reduce(
             not self.parallel_config.disable_custom_all_reduce)
         init_distributed_environment(self.parallel_config.world_size,
@@ -262,7 +263,13 @@ class NPUWorker(WorkerBase):
         ensure_model_parallel_initialized(
             self.parallel_config.tensor_parallel_size,
             self.parallel_config.pipeline_parallel_size)
-        init_ascend_model_parallel(self.parallel_config.expert_parallel_size)
+        
+        oproj_tensor_parallel_size = 1
+        if additional_config is not None and "oproj_tensor_parallel_size" in additional_config:
+            oproj_tensor_parallel_size = additional_config.get(
+                "oproj_tensor_parallel_size", 1)
+            
+        init_ascend_model_parallel(self.parallel_config.expert_parallel_size, oproj_tensor_parallel_size)
         ensure_kv_transfer_initialized(self.vllm_config)
 
     def _init_profiler(self):

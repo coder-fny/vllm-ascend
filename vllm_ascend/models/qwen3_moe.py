@@ -25,7 +25,7 @@ from torch import nn
 from transformers import PretrainedConfig
 from vllm.attention import Attention, AttentionMetadata
 from vllm.compilation.decorators import support_torch_compile
-from vllm.config import CacheConfig, VllmConfig
+from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
 from vllm.distributed import (get_ep_group, get_pp_group,
                               get_tensor_model_parallel_world_size,
                               get_tp_group)
@@ -56,6 +56,7 @@ from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.ops.fused_moe import AscendFusedMoE
 from vllm_ascend.ops.sequence_parallel import (MetadataForPadding,
                                                init_metadata_for_sp)
+from vllm_ascend.ops.oproj import oproj_RowParallelLinear_with_graph
 
 
 class AscendQwen3MoeSparseMoeBlock(nn.Module):
@@ -181,6 +182,8 @@ class CustomQwen3MoeAttention(Qwen3MoeAttention):
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
 
+        self.additional_config = get_current_vllm_config().additional_config
+
         self.qkv_proj = QKVParallelLinear(hidden_size,
                                           self.head_dim,
                                           self.total_num_heads,
@@ -189,11 +192,19 @@ class CustomQwen3MoeAttention(Qwen3MoeAttention):
                                           quant_config=quant_config,
                                           prefix=f"{prefix}.qkv_proj")
 
-        self.o_proj = RowParallelLinear(self.total_num_heads * self.head_dim,
-                                        hidden_size,
-                                        bias=False,
-                                        quant_config=quant_config,
-                                        prefix=f"{prefix}.o_proj")
+
+        if self.additional_config is not None and self.additional_config.get("oproj_tensor_parallel_size", False):
+            self.o_proj = oproj_RowParallelLinear_with_graph(self.total_num_heads * self.head_dim,
+                                            hidden_size,
+                                            bias=False,
+                                            quant_config=quant_config,
+                                            prefix=f"{prefix}.o_proj")
+        else:
+            self.o_proj = RowParallelLinear(self.total_num_heads * self.head_dim,
+                                            hidden_size,
+                                            bias=False,
+                                            quant_config=quant_config,
+                                            prefix=f"{prefix}.o_proj")
 
         self.rotary_emb = get_rope(
             self.head_dim,
