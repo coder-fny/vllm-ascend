@@ -24,6 +24,9 @@ import torch.distributed as dist
 import torch_npu
 from torch import nn
 from transformers import PretrainedConfig
+
+from vllm.logger import logger
+
 from vllm.attention import AttentionMetadata
 from vllm.config import get_current_vllm_config
 from vllm.distributed import (GroupCoordinator, get_tensor_model_parallel_rank,
@@ -416,24 +419,23 @@ def fused_experts_with_mc2(
         w2_t = w2.transpose(1, 2)
 
         # 阶段2: 流A执行Dispatch A
-        with torch_npu.npu.npu_stream_switch("streamA", 0):
-            kwargs = _build_dispatch_kwargs(hidden_states,topk_ids_A, expert_groupA_size, ctx)
-            dispatchA_result = _get_dispatch_func(ctx)(**kwargs)
-            expand_xA, _, assist_infoA, expert_tokensA, ep_recvA = dispatchA_result[:5]
+        # with npu_stream_switch("streamA", 0):
+        kwargs = _build_dispatch_kwargs(hidden_states,topk_ids_A, expert_groupA_size, ctx)
+        dispatchA_result = _get_dispatch_func(ctx)(**kwargs)
+        expand_xA, _, assist_infoA, expert_tokensA, ep_recvA = dispatchA_result[:5]
 
         # 阶段3: 流A执行Compute A + 流B执行Dispatch B（并行）
         # 流A: Compute A
         down_outA = None
-        with torch_npu.npu.npu_stream_switch("streamA", 0):
-            # 确保Dispatch A完成
-            torch_npu.npu.npu_wait_tensor(down_outA, expand_xA)
-            down_outA = _expert_forward(expand_xA, w1_t, w2_t, expert_tokensA)
-
+        # with npu_stream_switch("streamA", 0):
+        # 确保Dispatch A完成
+        # npu_wait_tensor(down_outA, expand_xA)
+        down_outA = _expert_forward(expand_xA, w1_t, w2_t, expert_tokensA)
         # 流B: Dispatch B（依赖Dispatch A完成）
         dispatchB_result = None
-        with torch_npu.npu.npu_stream_switch("streamB", 0):
+        with npu_stream_switch("moe_secondary", 0):
             # 等待Dispatch A完成
-            torch_npu.npu.npu_wait_tensor(dispatchB_result, expand_xA)
+            npu_wait_tensor(dispatchB_result, expand_xA)
             kwargs = _build_dispatch_kwargs(hidden_states,topk_ids_B, expert_groupB_size, ctx)
             dispatchB_result = _get_dispatch_func(ctx)(**kwargs)
             expand_xB, _, assist_infoB, expert_tokensB, ep_recvB = dispatchB_result[:5]
@@ -441,29 +443,28 @@ def fused_experts_with_mc2(
         # 阶段4: 流A执行Combine A + 流B执行Compute B（并行）
         # 流A: Combine A（依赖Compute A完成）
         resultA = None
-        with torch_npu.npu.npu_stream_switch("streamA", 0):
-            # 确保Compute A完成
-            torch_npu.npu.npu_wait_tensor(resultA, down_outA)
-            kwargs = _build_combine_kwargs(topk_ids_A, topk_weights_A, expert_groupA_size, down_outA, ep_recvA, dispatchA_result[5], assist_infoA, ctx)
-            resultA = _get_combine_func(ctx)(**kwargs)
-
+        # with npu_stream_switch("streamA", 0):
+        # 确保Compute A完成
+        # npu_wait_tensor(resultA, down_outA)
+        kwargs = _build_combine_kwargs(topk_ids_A, topk_weights_A, expert_groupA_size, down_outA, ep_recvA, dispatchA_result[5], assist_infoA, ctx)
+        resultA = _get_combine_func(ctx)(**kwargs)
         # 流B: Compute B（依赖Dispatch B完成）
         down_outB = None
-        with torch_npu.npu.npu_stream_switch("streamB", 0):
+        with npu_stream_switch("moe_secondary", 0):
             # 确保Dispatch B完成
-            torch_npu.npu.npu_wait_tensor(down_outB, expand_xB)
+            npu_wait_tensor(down_outB, expand_xB)
             down_outB = _expert_forward(expand_xB, w1_t, w2_t, expert_tokensB)
 
         # 阶段5: 流B执行Combine B（依赖Compute B完成）
         resultB = None
-        with torch_npu.npu.npu_stream_switch("streamB", 0):
+        with npu_stream_switch("moe_secondary", 0):
             # 确保Compute B完成
-            torch_npu.npu.npu_wait_tensor(resultB, down_outB)
+            npu_wait_tensor(resultB, down_outB)
             kwargs = _build_combine_kwargs(topk_ids_B, topk_weights_B, expert_groupB_size, down_outB, ep_recvB, dispatchB_result[5],  assist_infoB)
             resultB = _get_combine_func(ctx)(**kwargs)
 
         # 合并结果
-        torch_npu.npu.npu_wait_tensor(resultA, resultB)
+        npu_wait_tensor(resultA, resultB)
         return resultA + resultB
 
     ctx = _build_context()
@@ -473,6 +474,7 @@ def fused_experts_with_mc2(
                        shared_experts is None)
 
     if use_dual_stream:
+        logger.warning_once("=============vLLM is using dual stream")
         return _dual_stream_execution(
             ctx=ctx,
             hidden_states=hidden_states,
@@ -482,6 +484,7 @@ def fused_experts_with_mc2(
             w1=w1,
             w2=w2)
     else:
+        logger.warning_once("=============vLLM is using single stream")
         return _single_stream_execution(
             ctx=ctx,
             hidden_states=hidden_states,
