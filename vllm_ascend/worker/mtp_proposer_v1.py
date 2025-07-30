@@ -207,12 +207,27 @@ class MtpProposer:
 
         # Assuming force_one_token is on, so each perfill request query_lens is 1
         if attn_metadata.prefill is not None:
-            attn_metadata.prefill.query_lens[:] = 1
+            attn_metadata.prefill.query_lens = query_lens
+            attn_metadata.prefill.input_positions = target_positions
 
-        with set_ascend_forward_context(attn_metadata,
-                                        self.vllm_config,
-                                        num_tokens=num_input_tokens,
-                                        with_prefill=self.runner.with_prefill):
+        if not self.runner.torchair_graph_enabled:
+            # TODO: adapt enable_dbo later
+            (num_input_tokens, num_tokens_across_dp, with_prefill,
+             _) = self.runner._get_forward_metadata_across_dp(
+                 num_input_tokens, num_tokens, self.runner.with_prefill, False)
+            attn_metadata.slot_mapping = target_slot_mapping
+        else:
+            num_tokens_across_dp = self.runner.num_tokens_across_dp
+            with_prefill = self.runner.with_prefill
+
+        with set_ascend_forward_context(
+                attn_metadata,
+                self.vllm_config,
+                num_tokens=num_input_tokens,
+                with_prefill=with_prefill,
+                num_tokens_across_dp=num_tokens_across_dp,
+                in_profile_run=self.runner.in_profile_run,
+                num_actual_tokens=num_tokens):
             with ProfileExecuteDuration().capture_async('mtp_forward'):
                 model_kwargs = {}
                 model_kwargs["attn_metadata"] = attn_metadata
@@ -306,17 +321,64 @@ class MtpProposer:
                     ge_cache=False)
 
     @torch.inference_mode()
-    def dummy_run(self, num_tokens: int, with_prefill: bool = False) -> None:
-        attn_metadata = self.runner.attn_metadata_builder.build_torchair_graph_dummy(
-            num_reqs=num_tokens, num_actual_tokens=1, is_mtp_model=True)
-        with set_ascend_forward_context(None,
-                                        self.vllm_config,
-                                        num_tokens=num_tokens,
-                                        with_prefill=with_prefill):
-            self.model(input_ids=self.input_ids[:num_tokens],
-                       positions=self.positions[:num_tokens],
-                       previous_hidden_states=self.hidden_states[:num_tokens],
-                       attn_metadata=attn_metadata)
+    def dummy_run(self,
+                  num_tokens: int,
+                  with_prefill: bool = False,
+                  skip_attn: bool = False,
+                  num_reqs: int = 0,
+                  num_tokens_across_dp=None) -> None:
+        if not self.runner.torchair_graph_enabled:
+            # TODO: adapt enable_dbo later
+            (num_tokens, num_tokens_across_dp, with_prefill,
+             _) = self.runner._get_forward_metadata_across_dp(
+                 num_tokens, num_tokens, with_prefill, False)
+        is_running_torchair = self.runner.torchair_graph_enabled and \
+            not with_prefill
+
+        if is_running_torchair:
+            skip_attn = False
+        if skip_attn:
+            attn_metadata = None
+        else:
+            attn_metadata = self.runner.attn_metadata_builder.build_torchair_graph_dummy(
+                num_reqs=num_reqs, num_actual_tokens=1)
+
+        input_ids = self.input_ids[:num_tokens]
+        positions = self.positions[:num_tokens]
+        previous_hidden_states = self.hidden_states[:num_tokens]
+        with set_ascend_forward_context(
+                attn_metadata,
+                self.vllm_config,
+                num_tokens=num_tokens,
+                with_prefill=with_prefill,
+                num_tokens_across_dp=num_tokens_across_dp,
+                in_profile_run=self.runner.in_profile_run,
+                num_actual_tokens=0):
+            model_kwargs = {}
+            model_kwargs["attn_metadata"] = attn_metadata
+            if is_running_torchair:
+                assert attn_metadata is not None
+                model_kwargs["kv_caches"] = self.runner.kv_caches[-1:]
+                torch._dynamo.mark_static(input_ids)
+                torch._dynamo.mark_static(positions)
+                torch._dynamo.mark_static(previous_hidden_states)
+                torch._dynamo.mark_static(attn_metadata.decode.block_table)
+                torch._dynamo.mark_static(attn_metadata.decode.input_positions)
+                torch._dynamo.mark_static(attn_metadata.decode.sin)
+                torch._dynamo.mark_static(attn_metadata.decode.cos)
+                torch._dynamo.mark_static(get_forward_context().mc2_mask)
+                torch._dynamo.mark_static(attn_metadata.slot_mapping)
+                torch._dynamo.mark_static(attn_metadata.decode.attn_mask)
+                self.torchair_compiled_model(
+                    input_ids=input_ids,
+                    positions=positions,
+                    previous_hidden_states=previous_hidden_states,
+                    inputs_embeds=None,
+                    **model_kwargs)
+            else:
+                self.model(input_ids=input_ids,
+                           positions=positions,
+                           previous_hidden_states=previous_hidden_states)
 
 
 # TODO Using torch instead of triton may result in poor performance
