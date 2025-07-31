@@ -35,6 +35,7 @@ class oproj_RowParallelLinear_with_graph(LinearBase):
         # Divide the weight matrix along the first dimension.
         self.tp_rank = get_otp_group().rank_in_group
         self.tp_size = get_otp_group().world_size
+        self.dp_rank = get_dp_group().rank_in_group
         self.input_size_per_partition = divide(input_size, self.tp_size)
         self.output_size_per_partition = output_size
         self.output_partition_sizes = [output_size]
@@ -138,46 +139,107 @@ class oproj_RowParallelLinear_with_graph(LinearBase):
             splitted_input = split_tensor_along_last_dim(
                 input_, num_partitions=self.tp_size)
             input_parallel = splitted_input[tp_rank].contiguous()
+        
+        # 判断是否是prefill阶段，prefill阶段走单算子模式，会走alltoallv
+        forward_context = get_forward_context()
+        with_prefill = forward_context.with_prefill
+
         # Prepare tensors for all-to-all communication
         local_batch_size = input_parallel.size(0)
         chunk_size = self.input_size_per_partition
-        total_batch_size = local_batch_size * self.tp_size
-        # Reshape for all-to-all communication
-        # print(f"{'#' * 20} input_parallel: {input_parallel.shape}")
-        send_buf = (
-            input_parallel.reshape(-1, self.tp_size, chunk_size)
-            .transpose(0, 1)
-            .contiguous()
-            .view(-1))
 
-        # Create receive buffer
-        recv_buf = torch.empty(
-            total_batch_size * chunk_size,
-            dtype=input_parallel.dtype,
-            device=input_.device)
+        if not with_prefill:
+            total_batch_size = local_batch_size * self.tp_size
+            # Reshape for all-to-all communication
+            # print(f"{'#' * 20} input_parallel: {input_parallel.shape}")
+            send_buf = (
+                input_parallel.reshape(-1, self.tp_size, chunk_size)
+                .transpose(0, 1)
+                .contiguous()
+                .view(-1))
 
-        # Perform all-to-all communication
-        dist.all_to_all_single(
-            recv_buf, send_buf, group=get_otp_group().device_group)
-        all_to_all_result = recv_buf.view(total_batch_size, chunk_size)
+            # Create receive buffer
+            recv_buf = torch.empty(
+                total_batch_size * chunk_size,
+                dtype=input_parallel.dtype,
+                device=input_.device)
+
+            # Perform all-to-all communication
+            dist.all_to_all_single(
+                recv_buf, send_buf, group=get_otp_group().device_group)
+            all_to_all_result = recv_buf.view(total_batch_size, chunk_size)
+        else:
+            cu_tokens_across_dp_cpu = forward_context.dp_metadata.cu_tokens_across_dp_cpu
+            prefix_array = cu_tokens_across_dp_cpu.numpy()
+            global_batch_size = np.concatenate(
+                ([prefix_array[0]], np.diff(prefix_array)))
+            otp_group_id = self.dp_rank // self.tp_size
+            otp_group_batchsize = global_batch_size[otp_group_id * self.tp_size: otp_group_id * self.tp_size + self.tp_size]
+            otp_total_batchsize = sum(otp_group_batchsize)
+
+            # Reshape for all-to-all communication
+            send_buf = (
+                input_parallel.reshape(-1, self.tp_size, chunk_size)
+                .transpose(0, 1)
+                .contiguous()
+                .view(-1))
+
+            # Create receive buffer
+            recv_buf = torch.empty(
+                otp_total_batchsize * chunk_size,
+                dtype=input_parallel.dtype,
+                device=input_parallel.device)
+
+            # Create split array
+            recv_splits = [size * chunk_size for size in otp_group_batchsize]
+            send_splits = [local_batch_size * chunk_size] * self.tp_size
+
+            # Perform all-to-all communication
+            dist.all_to_all_single(
+                recv_buf, 
+                send_buf,
+                recv_splits,
+                send_splits,
+                group=get_otp_group().device_group)
+
+            all_to_all_result = recv_buf.view(otp_total_batchsize, chunk_size)
+
         # Matrix multiply with quantized method
         assert self.quant_method is not None
         # Only fuse bias add for rank 0 to avoid duplicate bias addition in TP>1
         bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
         output_parallel = self.quant_method.apply(
             self, all_to_all_result, bias=bias_)
-        # Reduce-scatter the results across devices
-        final_result = get_otp_group().reduce_scatter(output_parallel, dim=0)
+        
+        if not with_prefill:
+            # Reduce-scatter the results across devices
+            final_result = get_otp_group().reduce_scatter(output_parallel, dim=0)
+        else:
+            # prepare all-reduce data
+            final_result = torch.empty(
+                    local_batch_size, 
+                    output_parallel.size(1), 
+                    dtype=output_parallel.dtype, 
+                    device=output_parallel.device)
+
+            recv_chunks = []
+            start_idx = 0
+            for size in otp_group_batchsize:
+                chunk = output_parallel[start_idx:start_idx + size, :]
+                recv_chunks.append(chunk.contiguous())
+                start_idx += size
+
+            # Reduce-scatter the results across devices
+            dist.reduce_scatter(
+                    final_result, 
+                    recv_chunks, 
+                    op=dist.ReduceOp.SUM, 
+                    group=get_otp_group().device_group)
+        
         # Handle bias return based on configuration
         output_bias = self.bias if self.skip_bias_add else None
         if not self.return_bias:
             return final_result
-        
-        # final_result = torch.empty(
-        #     local_batch_size * self.output_size_per_partition,
-        #     dtype=input_parallel.dtype,
-        #     device=input_.device)
-        # final_result = final_result.reshape(local_batch_size, self.output_size_per_partition)
         
         return final_result, output_bias
 

@@ -1033,7 +1033,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         if self.torchair_graph_enabled and not with_prefill:
             maybe_padded_num_tokens = self.select_torchair_padded_batch_size(
                 total_num_scheduled_tokens)
-        print(f"{'####'*10}\nprocess_reqs rank:{get_dp_group().rank_in_group}:\n {maybe_padded_num_tokens} {num_tokens} {with_prefill}")
+        # print(f"{'####'*10}\nprocess_reqs rank:{get_dp_group().rank_in_group}:\n {maybe_padded_num_tokens} {num_tokens} {with_prefill}")
         (padded_num_tokens_across_dp, num_tokens_across_dp, with_prefill,
          enable_dbo) = self._get_forward_metadata_across_dp(
              maybe_padded_num_tokens, total_num_scheduled_tokens, with_prefill,
