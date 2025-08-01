@@ -184,7 +184,16 @@ class CustomQwen3MoeAttention(Qwen3MoeAttention):
 
         self.additional_config = get_current_vllm_config().additional_config
 
-        self.qkv_proj = QKVParallelLinear(hidden_size,
+        if self.additional_config is not None and self.additional_config.get("qkvproj_tensor_parallel_size", False):
+            self.qkv_proj = qkvproj_QKVParallelLinear(hidden_size,
+                                          self.head_dim,
+                                          self.total_num_heads,
+                                          self.total_num_kv_heads,
+                                          bias=qkv_bias,
+                                          quant_config=quant_config,
+                                          prefix=f"{prefix}.qkv_proj")
+        else:
+            self.qkv_proj = QKVParallelLinear(hidden_size,
                                           self.head_dim,
                                           self.total_num_heads,
                                           self.total_num_kv_heads,
