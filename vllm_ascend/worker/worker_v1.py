@@ -269,7 +269,12 @@ class NPUWorker(WorkerBase):
             oproj_tensor_parallel_size = additional_config.get(
                 "oproj_tensor_parallel_size", 1)
             
-        init_ascend_model_parallel(self.parallel_config.expert_parallel_size, oproj_tensor_parallel_size)
+        qkvproj_tensor_parallel_size = 1
+        if additional_config is not None and "qkvproj_tensor_parallel_size" in additional_config:
+            qkvproj_tensor_parallel_size = additional_config.get(
+                "qkvproj_tensor_parallel_size", 1)
+            
+        init_ascend_model_parallel(self.parallel_config.expert_parallel_size, oproj_tensor_parallel_size, qkvproj_tensor_parallel_size)
         ensure_kv_transfer_initialized(self.vllm_config)
 
     def _init_profiler(self):

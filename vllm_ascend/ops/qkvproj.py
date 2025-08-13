@@ -24,17 +24,102 @@ from vllm.model_executor.parameter import (BasevLLMParameter,
                                            PackedvLLMParameter,
                                            PerTensorScaleParameter,
                                            RowvLLMParameter)
+from vllm.distributed.parallel_state import get_dp_group
 # yapf: enable
 from vllm.model_executor.utils import set_weight_attrs
 
 from vllm_ascend.distributed.parallel_state import get_qkvtp_group
-from vllm.model_executor.layers.linear import ColumnParallelLinear
+from vllm.model_executor.layers.linear import WEIGHT_LOADER_V2_SUPPORTED, LinearBase
 from vllm.forward_context import get_forward_context
 
 logger = init_logger(__name__)
 
+class CustomColumnParallelLinear(LinearBase):
+    """Linear layer with column parallelism.
 
-class qkvproj_QKVParallelLinear(ColumnParallelLinear):
+    The linear layer is defined as Y = XA + b. A is parallelized along
+    its second dimension as A = [A_1, ..., A_p].
+
+    Args:
+        input_size: first dimension of matrix A.
+        output_size: second dimension of matrix A.
+        bias: If true, add bias.
+        gather_output: If true, call all-gather on output and make Y available
+                       to all GPUs, otherwise, every GPU will have its output
+                       which is Y_i = XA_i
+        skip_bias_add: This was added to enable performance optimizations where
+                       bias can be fused with other element-wise operations. we
+                       skip adding bias but instead return it.
+        params_dtype: Data type for the parameters.
+        quant_config: Quantization configure.
+        output_sizes: list of output sizes packed into one output, like for QKV
+                       the list would be size 3.
+        prefix: The name of the layer in the state dict, including all parents
+                        (e.g. model.layers.0.qkv_proj) 
+    """
+
+    def __init__(
+        self,
+        input_size: int,
+        output_size: int,
+        bias: bool = True,
+        gather_output: bool = False,
+        skip_bias_add: bool = False,
+        params_dtype: Optional[torch.dtype] = None,
+        quant_config: Optional[QuantizationConfig] = None,
+        output_sizes: Optional[list[int]] = None,
+        prefix: str = "",
+        *,
+        return_bias: bool = True,
+    ):
+        # Divide the weight matrix along the last dimension.
+        self.tp_size = get_qkvtp_group().world_size
+        self.input_size_per_partition = input_size
+        self.output_size_per_partition = divide(output_size, self.tp_size)
+        self.output_partition_sizes = [self.output_size_per_partition]
+        # If QKV or MergedColumn, use output size of each partition.
+        if hasattr(self, "output_sizes"):
+            self.output_partition_sizes = [
+                divide(output_size, self.tp_size)
+                for output_size in self.output_sizes
+            ]
+
+        super().__init__(input_size,
+                         output_size,
+                         skip_bias_add,
+                         params_dtype,
+                         quant_config,
+                         prefix,
+                         return_bias=return_bias)
+
+        self.gather_output = gather_output
+
+        if output_sizes is None:
+            output_sizes = [output_size]
+
+        assert self.quant_method is not None
+        self.quant_method.create_weights(
+            layer=self,
+            input_size_per_partition=self.input_size_per_partition,
+            output_partition_sizes=self.output_partition_sizes,
+            input_size=self.input_size,
+            output_size=self.output_size,
+            params_dtype=self.params_dtype,
+            weight_loader=(
+                self.weight_loader_v2 if self.quant_method.__class__.__name__
+                in WEIGHT_LOADER_V2_SUPPORTED else self.weight_loader))
+        if bias:
+            self.bias = Parameter(
+                torch.empty(self.output_size_per_partition,
+                            dtype=params_dtype))
+            set_weight_attrs(self.bias, {
+                "output_dim": 0,
+                "weight_loader": self.weight_loader,
+            })
+        else:
+            self.register_parameter("bias", None)
+
+class qkvproj_QKVParallelLinear(CustomColumnParallelLinear):
     """Linear layers for the attention's QKV transformation.
 
     Linear layers for the linear transformation of the query, key, and value
@@ -85,22 +170,22 @@ class qkvproj_QKVParallelLinear(ColumnParallelLinear):
             total_num_kv_heads = total_num_heads
         self.total_num_kv_heads = total_num_kv_heads
         # Divide the weight matrix along the last dimension.
-        tp_size = get_qkvtp_group().world_size
-        self.num_heads = divide(self.total_num_heads, tp_size)
-        if tp_size >= self.total_num_kv_heads:
+
+        self.num_heads = divide(self.total_num_heads, self.tp_size)
+        if self.tp_size >= self.total_num_kv_heads:
             self.num_kv_heads = 1
-            self.num_kv_head_replicas = divide(tp_size,
+            self.num_kv_head_replicas = divide(self.tp_size,
                                                self.total_num_kv_heads)
         else:
-            self.num_kv_heads = divide(self.total_num_kv_heads, tp_size)
+            self.num_kv_heads = divide(self.total_num_kv_heads, self.tp_size)
             self.num_kv_head_replicas = 1
         input_size = self.hidden_size
         output_size = (self.num_heads +
-                       2 * self.num_kv_heads) * tp_size * self.head_size
+                       2 * self.num_kv_heads) * self.tp_size * self.head_size
         self.output_sizes = [
-            self.num_heads * self.head_size * tp_size,  # q_proj
-            self.num_kv_heads * self.head_size * tp_size,  # k_proj
-            self.num_kv_heads * self.head_size * tp_size,  # v_proj 
+            self.num_heads * self.head_size * self.tp_size,  # q_proj
+            self.num_kv_heads * self.head_size * self.tp_size,  # k_proj
+            self.num_kv_heads * self.head_size * self.tp_size,  # v_proj 
         ]
 
         super().__init__(input_size=input_size,
@@ -223,8 +308,8 @@ class qkvproj_QKVParallelLinear(ColumnParallelLinear):
             return
 
         if is_gguf_weight:
-            tp_size = get_tensor_model_parallel_world_size()
-            tp_rank = get_tensor_model_parallel_rank()
+            tp_size = self.tp_size
+            tp_rank = self.tp_rank
 
             output_dim = getattr(param, "output_dim", None)
             shard_size = loaded_weight.size(output_dim) // tp_size
@@ -303,7 +388,7 @@ class qkvproj_QKVParallelLinear(ColumnParallelLinear):
                 self.weight_loader(param, loaded_weight_shard, shard_id)
             return
 
-        tp_rank = get_tensor_model_parallel_rank()
+        tp_rank = self.tp_rank
         assert loaded_shard_id in ["q", "k", "v"]
 
         # If output dim is defined, use the default loading process.
@@ -393,53 +478,67 @@ class qkvproj_QKVParallelLinear(ColumnParallelLinear):
         # 判断是否是prefill阶段，prefill阶段走单算子模式，会走alltoallv
         forward_context = get_forward_context()
         with_prefill = forward_context.with_prefill
+        local_batch_size = input_.size(0)
 
         if not with_prefill:
-            local_batch_size = input_.size(0)
-            qkv_tp_group_total_batchsize = local_batch_size * self.tp_size
-            gather_input = get_qkvtp_group().all_gather(input_, dim=0)
+            gather_output = get_qkvtp_group().all_gather(input_, dim=0)
         else:
             cu_tokens_across_dp_cpu = forward_context.dp_metadata.cu_tokens_across_dp_cpu
             prefix_array = cu_tokens_across_dp_cpu.numpy()
             global_batch_size = np.concatenate(
                 ([prefix_array[0]], np.diff(prefix_array)))
             qkv_tp_group_id = self.dp_rank // self.tp_size
-            torch_list = [torch.zeros(size, input_.size(1), device=input_.device) for size in 
-                            global_batch_size[qkv_tp_group_id*self.tp_size: (qkv_tp_group_id+1)*self.tp_size]]
-            gather_output = dist.all_gather(torch_list, input_)
-            gather_output = torch.concat(gather_output, dim=0)
+            qkv_tp_group_batchsize = global_batch_size[qkv_tp_group_id*self.tp_size: (qkv_tp_group_id+1)*self.tp_size]
+
+            torch_list = [torch.zeros(size, input_.size(1), dtype=input_.dtype, device=input_.device) 
+                        for size in qkv_tp_group_batchsize]
+            dist.all_gather(torch_list, input_, group=get_qkvtp_group().device_group)
+            gather_output = torch.concat(torch_list, dim=0)
 
         # Matrix multiply.
         assert self.quant_method is not None
-        output_parallel = self.quant_method.apply(self, gather_input, bias)
+        output_parallel = self.quant_method.apply(self, gather_output, bias)
+
+        chunk_size = output_parallel.size(1)
+        send_buf = (
+            output_parallel
+            .contiguous()
+            .view(-1))
+        
+        # Create receive buffer
+        recv_buf = torch.empty(
+            local_batch_size * chunk_size * self.tp_size,
+            dtype=output_parallel.dtype,
+            device=output_parallel.device)
+
         if self.gather_output:
             # TODO gather output
-            pass
-        else:
-            # prepare all to all data
-            chunk_size = output_parallel.size(1)
-            send_buf = (
-                output_parallel.reshape(-1, self.tp_size, chunk_size)
-                .transpose(0, 1)
-                .contiguous()
-                .view(-1))
-
-            # Create receive buffer
-            recv_buf = torch.empty(
-                local_batch_size * chunk_size * self.tp_size,
-                dtype=output_parallel.dtype,
-                device=output_parallel.device)
+            return get_qkvtp_group().all_gather(output_parallel, dim=1)
+        elif not with_prefill:
             dist.all_to_all_single(recv_buf, send_buf, group=get_qkvtp_group().device_group)
-            output = recv_buf.view(self.tp_size, local_batch_size, chunk_size)
-            sizes = [self.num_heads * self.head_size, self.num_kv_heads * self.head_size, self.num_kv_heads * self.head_size]
-            outs = [
-                part.permute(1, 0, 2).reshape(local_batch_size, size * self.tp_size)
-                for part, size in zip(
-                    torch.split(output, split_size_or_sections=sizes, dim=-1),
-                    sizes
-                )
-            ]
-            output = torch.cat(outs, dim=1)
+        else:
+            # Create split array
+            send_splits = [size * chunk_size for size in qkv_tp_group_batchsize]
+            recv_splits = [local_batch_size * chunk_size] * self.tp_size
+
+            # Perform all-to-all communication
+            dist.all_to_all_single(
+                recv_buf, 
+                send_buf,
+                recv_splits,
+                send_splits,
+                group=get_qkvtp_group().device_group)
+        
+        output = recv_buf.view(self.tp_size, local_batch_size, chunk_size)
+        sizes = [self.num_heads * self.head_size, self.num_kv_heads * self.head_size, self.num_kv_heads * self.head_size]
+        outs = [
+            part.permute(1, 0, 2).reshape(local_batch_size, size * self.tp_size)
+            for part, size in zip(
+                torch.split(output, split_size_or_sections=sizes, dim=-1),
+                sizes
+            )
+        ]
+        output = torch.cat(outs, dim=1)
 
         output_bias = self.bias if self.skip_bias_add else None
         if not self.return_bias:
