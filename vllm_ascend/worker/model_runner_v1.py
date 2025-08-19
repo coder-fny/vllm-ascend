@@ -347,8 +347,10 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             and self.compilation_config.level == CompilationLevel.PIECEWISE
             and not self.model_config.enforce_eager
             and not ascend_config.torchair_graph_config.enabled)
-        self.aclgraph_batch_sizes = list(
-            reversed(self.compilation_config.cudagraph_capture_sizes))
+        
+        if self.use_aclgraph:
+            self.aclgraph_batch_sizes = list(
+                reversed(self.compilation_config.cudagraph_capture_sizes))
 
         self.uniform_decode_query_len = 1 if not self.speculative_config else \
             1 + self.speculative_config.num_speculative_tokens
