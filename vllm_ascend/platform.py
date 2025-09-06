@@ -192,6 +192,10 @@ class NPUPlatform(Platform):
                 parallel_config.worker_cls = "vllm_ascend.torchair.torchair_worker.NPUTorchairWorker"
             else:
                 parallel_config.worker_cls = "vllm_ascend.worker.worker_v1.NPUWorker"
+        
+        if parallel_config:
+            parallel_config.oproj_tensor_parallel_size = \
+                ascend_config.oproj_tensor_parallel_size
 
         if cache_config:
             if cache_config.block_size is None:

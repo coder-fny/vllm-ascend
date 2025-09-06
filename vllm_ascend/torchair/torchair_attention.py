@@ -26,6 +26,8 @@ from vllm.attention.backends.abstract import (AttentionImpl, AttentionLayer,
                                               AttentionType)
 from vllm.attention.backends.utils import PAD_SLOT_ID
 from vllm.config import VllmConfig
+from vllm.distributed.parallel_state import get_tp_group, get_world_group
+from vllm.distributed import get_dp_group
 from vllm.utils import cdiv
 
 from vllm_ascend.attention.attention_v1 import (AscendAttentionBackend,
@@ -36,7 +38,6 @@ from vllm_ascend.attention.utils import AscendCommonAttentionMetadata
 from vllm_ascend.torchair.utils import TorchairCommonAttentionMetadata
 from vllm_ascend.utils import (ACL_FORMAT_FRACTAL_NZ, aligned_16, is_310p,
                                nd_to_nz_2d)
-
 
 class AscendAttentionTorchairBackend(AscendAttentionBackend):
     accept_output_buffer: bool = True
@@ -366,13 +367,18 @@ class AscendAttentionTorchairBackendImpl(AttentionImpl):
             key_cache, value_cache = kv_cache[0], kv_cache[1]
             slots = attn_metadata.slot_mapping
 
-            block_size = key_cache.shape[1]
+            # block_size = key_cache.shape[1]
+            block_size = torch.zeros((), device=slots.device, dtype=torch.int32) + key_cache.shape[1]
             slots_indices = slots.reshape(-1, 1)
             block_indices = slots_indices // block_size
             slots_indices = slots_indices % block_size
             indices = torch.cat((block_indices, slots_indices), dim=1)
             torch_npu.npu_scatter_nd_update_(key_cache, indices, key)
             torch_npu.npu_scatter_nd_update_(value_cache, indices, value)
+
+            if attn_metadata.attn_state == AscendAttentionState.PrefillCacheHit:
+                self.key_cache = key_cache
+                self.value_cache = value_cache
 
         if attn_metadata.attn_state == AscendAttentionState.PrefillNoCache:
             assert attn_metadata is not None
@@ -410,11 +416,13 @@ class AscendAttentionTorchairBackendImpl(AttentionImpl):
             assert attn_metadata is not None
             assert attn_metadata.attn_mask is not None
             compress_mask = attn_metadata.attn_mask
+            batch_size = attn_metadata.query_lens.shape[0]
+            block_tables = attn_metadata.block_tables[:batch_size, :]
             torch_npu._npu_flash_attention_qlens(
                 query=query,
                 key_cache=self.key_cache,
                 value_cache=self.value_cache,
-                block_table=attn_metadata.block_tables,
+                block_table=block_tables,
                 mask=compress_mask,
                 seq_len=attn_metadata.query_lens,
                 context_lens=attn_metadata.seq_lens,

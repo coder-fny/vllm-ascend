@@ -33,6 +33,7 @@ from torch_npu.npu.streams import Event
 from vllm.logger import logger
 
 import vllm_ascend.envs as envs_ascend
+from vllm_ascend.ascend_config import get_ascend_config
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -539,3 +540,6 @@ def get_ascend_soc_version():
     global _ascend_soc_version
     assert _ascend_soc_version is not None
     return _ascend_soc_version
+
+def oproj_tp_enable():
+    return get_ascend_config().oproj_tensor_parallel_size is not None

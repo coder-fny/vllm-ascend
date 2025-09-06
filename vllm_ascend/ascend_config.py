@@ -51,6 +51,16 @@ class AscendConfig:
             "enable_shared_expert_dp", False
         ) and not self.torchair_graph_config.enabled and vllm_config.parallel_config.enable_expert_parallel
 
+        self.oproj_tensor_parallel_size = additional_config.get("oproj_tensor_parallel_size", None)
+        if self.oproj_tensor_parallel_size:
+            logger.info(
+                f"Enable oproj independent tp sharding and oproj_tensor_parallel_size is {self.oproj_tensor_parallel_size}.")
+            assert (vllm_config.parallel_config.tensor_parallel_size == 1, 
+                "oproj_tensor_parallel_size is only supported in the pure DP scenario.")
+            assert (self.oproj_tensor_parallel_size > 1 and
+                    vllm_config.parallel_config.world_size % self.oproj_tensor_parallel_size == 0,
+                "`oproj_tensor_parallel_size` should be greater than 1 and divisible by the world size.")
+
 
 class TorchairGraphConfig:
     """
@@ -59,6 +69,7 @@ class TorchairGraphConfig:
 
     def __init__(self, torchair_graph_config):
         self.enabled = torchair_graph_config.get("enabled", False)
+        self.mode = torchair_graph_config.get("mode", 'max-autotune')
         self.use_cached_graph = torchair_graph_config.get(
             "use_cached_graph", False)
         self.graph_batch_sizes = torchair_graph_config.get(

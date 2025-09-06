@@ -314,6 +314,7 @@ class NPUTorchairModelRunner(NPUModelRunner):
             communication_adaptation_310p()
 
         config = torchair.CompilerConfig()
+        config.mode = get_ascend_config().torchair_graph_config.mode
         config.experimental_config.frozen_parameter = True
         # enabling tiling_schedule_optimize on 300I Duo has some bugs, so we have to
         # disable it on 300I Duo platform now.
@@ -419,3 +420,7 @@ class NPUTorchairModelRunner(NPUModelRunner):
 
     def _build_drafter_prepare_inputs_torchair_param(self):
         return True
+
+    def get_dp_padding(self,
+                    num_tokens: int) -> tuple[int, Optional[torch.Tensor]]:
+        return 0, None

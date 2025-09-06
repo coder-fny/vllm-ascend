@@ -53,9 +53,12 @@ from vllm.sequence import IntermediateTensors
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
+from vllm_ascend.distributed.parallel_state import get_otp_group
 from vllm_ascend.ops.fused_moe import AscendFusedMoE
+from vllm_ascend.ops.independent_tp_sharding import DownProjectionParallelLinear, ExecutionConfig
 from vllm_ascend.ops.sequence_parallel import (MetadataForPadding,
                                                init_metadata_for_sp)
+from vllm_ascend.utils import vllm_version_is, oproj_tp_enable
 
 
 class CustomSparseMoeBlock(Qwen3MoeSparseMoeBlock):
@@ -179,11 +182,20 @@ class CustomQwen3MoeAttention(Qwen3MoeAttention):
                                           quant_config=quant_config,
                                           prefix=f"{prefix}.qkv_proj")
 
-        self.o_proj = RowParallelLinear(self.total_num_heads * self.head_dim,
-                                        hidden_size,
-                                        bias=False,
-                                        quant_config=quant_config,
-                                        prefix=f"{prefix}.o_proj")
+        if oproj_tp_enable():
+            self.o_proj = DownProjectionParallelLinear(self.total_num_heads * self.head_dim,
+                                            hidden_size,
+                                            bias=False,
+                                            quant_config=quant_config,
+                                            prefix=f"{prefix}.o_proj",
+                                            tp_group_cls=get_otp_group(),
+                                            execute_config=ExecutionConfig(prefill_mode="eager", decode_mode="graph"))
+        else:
+            self.o_proj = RowParallelLinear(self.total_num_heads * self.head_dim,
+                                            hidden_size,
+                                            bias=False,
+                                            quant_config=quant_config,
+                                            prefix=f"{prefix}.o_proj")
 
         self.rotary_emb = get_rope(
             self.head_dim,
