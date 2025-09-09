@@ -235,7 +235,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         self.attn_metadata_builder = self.attn_backend.get_builder_cls()(
             vllm_config, device)
         self.attn_mask_builder = AttentionMaskBuilder(
-            self.model_config.max_model_len, self.dtype)
+            min(self.model_config.max_model_len, 128), self.dtype)
 
         # Set up speculative decoding.
         self.spec_attn_mask = None
@@ -610,7 +610,6 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         # Unpack the results
         num_tokens_across_dp = packed_tensor[:-2]
         synced_flags = packed_tensor[-2:]
-
         max_tokens_across_dp = torch.max(num_tokens_across_dp).item()
         global_with_prefill = bool(synced_flags[0])
         global_enable_dbo = not bool(synced_flags[1])
@@ -683,9 +682,9 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                 seq_lens, position, self.dtype, self.device)
         # Prefill without cache situation.
         elif attn_state == AscendAttentionState.PrefillNoCache:
-            max_seq_len = max(seq_lens, default=0)
+            # max_seq_len = max(seq_lens, default=0)
             return self.attn_mask_builder.get_attn_mask(
-                max_seq_len, self.dtype, self.device)
+                128, self.dtype, self.device)
         # Prefill with cache hit.
         elif attn_state == AscendAttentionState.PrefillCacheHit:
             return self.attn_mask_builder.get_attn_mask(
