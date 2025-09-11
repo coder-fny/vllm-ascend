@@ -133,8 +133,9 @@ env_variables: Dict[str, Callable[[], Any]] = {
     lambda: bool(int(os.getenv("VLLM_ASCEND_ENABLE_MATMUL_ALLREDUCE", '0'))),
     # Whether to enable FlashComm optimization when tensor parallel is enabled.
     # This feature will get better performance when concurrency is large.
+    # FlashComm optimization: Enable v1 and v2 by setting this flag to 1 or 2 respectively
     "VLLM_ASCEND_ENABLE_FLASHCOMM":
-    lambda: bool(int(os.getenv("VLLM_ASCEND_ENABLE_FLASHCOMM", '0'))),
+    lambda: int(os.getenv("VLLM_ASCEND_ENABLE_FLASHCOMM", '0')),
     # Whether to enable MLP weight prefetch, only used in small concurrency.
     "VLLM_ASCEND_ENABLE_PREFETCH_MLP":
     lambda: bool(int(os.getenv("VLLM_ASCEND_ENABLE_PREFETCH_MLP", '0'))),
