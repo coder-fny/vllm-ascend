@@ -1479,7 +1479,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                 )
             else:
                 blk_table = self.input_batch.block_table[kv_cache_group_id]
-                blk_table_tensor = blk_table.get_device_tensor()
+                blk_table_tensor = blk_table.get_device_tensor()[:num_reqs]
 
                 if not with_prefill and maybe_padded_num_tokens > total_num_scheduled_tokens:
                     extra_padding_tokens = maybe_padded_num_tokens - total_num_scheduled_tokens
@@ -1491,7 +1491,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                         [blk_table_tensor, block_table_padding], dim=0)
 
                 slot_mapping = blk_table.slot_mapping_cpu[:
-                                                        total_num_scheduled_tokens]
+                                                          total_num_scheduled_tokens]
                 self.slot_mapping[:total_num_scheduled_tokens].copy_(
                     slot_mapping[:total_num_scheduled_tokens],
                     non_blocking=True,
@@ -1507,7 +1507,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                 num_actual_tokens=total_num_scheduled_tokens,
                 actual_seq_lengths_q=self.actual_seq_lengths_q,
                 # TODO: change this to the right block table for linear attn
-                block_table_tensor=blk_table_tensor[:num_reqs],
+                block_table_tensor=blk_table_tensor,
                 slot_mapping=self.slot_mapping,
                 num_computed_tokens_cpu=num_computed_tokens_cpu,
                 positions=self.positions,
