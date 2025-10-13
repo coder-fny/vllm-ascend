@@ -26,6 +26,7 @@ import torch
 from torch import nn
 from vllm.attention import Attention, AttentionMetadata
 from vllm.config import CacheConfig, get_current_vllm_config
+from vllm.distributed.parallel_state import get_tensor_model_parallel_world_size
 from vllm.forward_context import ForwardContext, get_forward_context
 from vllm.model_executor.layers.mla import MultiHeadLatentAttention
 from vllm.model_executor.layers.quantization import QuantizationConfig
@@ -127,6 +128,18 @@ class AscendMultiHeadLatentAttention(MultiHeadLatentAttention):
         else:
             output_shape = torch.chunk(hidden_states, self.tp_size,
                                        dim=0)[0].shape
+        #TODO: ???
+        forward_context = get_forward_context()
+        is_prefill = forward_context.with_prefill
+        if forward_context.flashcomm_v2_enabled:
+            num_padding_tokens = forward_context.pad_size
+            # if is_prefill and self.debug_layer_idx > 0 and self.debug_layer_idx < self.layers:
+            #     output_shape = hidden_states.shape
+            # else:
+            B = (hidden_states.shape[0] + num_padding_tokens) // get_tensor_model_parallel_world_size()
+            H = hidden_states.shape[1]
+            output_shape = (B, H)
+
         # FIXME: This does not seem right, should make sure the buffer is fixed
         output = torch.empty(output_shape,
                              dtype=hidden_states.dtype,
