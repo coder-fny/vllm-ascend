@@ -147,6 +147,7 @@ def init_ascend_model_parallel(parallel_config: ParallelConfig, ):
     if flashcomm2_enable():
         flashcomm2_otp_size = get_ascend_config().flashcomm2_oproj_tensor_parallel_size
         global_tp_size = get_tp_group().world_size
+        global_dp_size = get_tp_group().world_size
         num_oproj_tensor_parallel_groups: int = (global_tp_size // flashcomm2_otp_size)
 
         global _FLASHCOMM2_OTP
@@ -157,16 +158,17 @@ def init_ascend_model_parallel(parallel_config: ParallelConfig, ):
 
         if flashcomm2_otp_size > 1:
             otp_group_ranks = []
-            odp_group_ranks = [[] for _ in range(flashcomm2_otp_size)]
-            dp_group_index = torch.distributed.get_rank() // global_tp_size
+            odp_group_ranks = [[] for _ in range(flashcomm2_otp_size * global_dp_size)]
 
-            for i in range(num_oproj_tensor_parallel_groups):
-                ranks = []
-                for j in range(flashcomm2_otp_size):
-                    rank_idx = dp_group_index * global_tp_size + i + j * num_oproj_tensor_parallel_groups
-                    ranks.append(rank_idx)
-                    odp_group_ranks[j].append(rank_idx)
-                otp_group_ranks.append(ranks)
+            for dp_group_index in range(global_dp_size):
+                for i in range(num_oproj_tensor_parallel_groups):
+                    ranks = []
+                    for j in range(flashcomm2_otp_size):
+                        rank_idx = dp_group_index * global_tp_size + i + j * num_oproj_tensor_parallel_groups
+                        ranks.append(rank_idx)
+                        odp_group_index = dp_group_index * flashcomm2_otp_size + j
+                        odp_group_ranks[odp_group_index].append(rank_idx)
+                    otp_group_ranks.append(ranks)
 
             _FLASHCOMM2_OTP = init_model_parallel_group(otp_group_ranks,
                                     get_world_group().local_rank,
