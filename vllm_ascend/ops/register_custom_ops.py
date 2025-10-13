@@ -146,7 +146,7 @@ def _maybe_all_gather_and_maybe_unpad_fake(
         label: bool,
         is_ep_comm: bool = False) -> torch.Tensor:
 
-    if get_forward_context().sp_enabled and label:
+    if (get_forward_context().sp_enabled or get_forward_context().flashcomm_v2_enabled) and label:
         return torch.empty(
             (x.shape[0] * get_tensor_model_parallel_world_size(),
              *x.shape[1:]),
@@ -158,7 +158,7 @@ def _maybe_all_gather_and_maybe_unpad_fake(
 
 def _maybe_pad_and_reduce_fake(x: torch.Tensor,
                                is_ep_comm: bool = False) -> torch.Tensor:
-    if get_forward_context().sp_enabled:
+    if get_forward_context().sp_enabled or get_forward_context().flashcomm_v2_enabled:
         return torch.empty(
             (x.shape[0] // get_tensor_model_parallel_world_size(),
              *x.shape[1:]),
@@ -256,7 +256,7 @@ def _maybe_all_reduce_tensor_model_parallel_impl(
     forward_context = get_forward_context()
     moe_comm_type = forward_context.moe_comm_type
     if moe_comm_type in {MoECommType.ALLTOALL, MoECommType.MC2
-                         } or forward_context.sp_enabled:
+                         } or forward_context.sp_enabled or forward_context.flashcomm_v2_enabled:
         return final_hidden_states
     else:
         return tensor_model_parallel_all_reduce(final_hidden_states)

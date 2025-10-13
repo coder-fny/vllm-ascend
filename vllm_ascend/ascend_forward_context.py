@@ -183,7 +183,7 @@ def set_ascend_forward_context(
                 forward_context.dp_metadata.cu_tokens_across_dp_cpu.cpu()
             max_tokens_across_dp = \
                 forward_context.dp_metadata.max_tokens_across_dp_cpu.item()
-            if sp_enabled:
+            if sp_enabled or flashcomm_v2_enabled:
                 padded_length = (max_tokens_across_dp + tp_world_size -
                                  1) // tp_world_size * tp_world_size
                 pad_size = padded_length - num_tokens

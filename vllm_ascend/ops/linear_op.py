@@ -422,10 +422,6 @@ class Flashcomm2OProjRowParallelOp(CustomRowParallelOp):
 
         print(f"Flashcomm2OProjRowParallelOp--input_parallel.shape={input_parallel.shape}")
         print(f"Flashcomm2OProjRowParallelOp--before all2all input_parallel={input_parallel}")
-        import os
-        if get_tp_group().rank_in_group == 0 and not os.path.exists("/mnt/deepseek/cloudide/yujinqi/issue/flashcomm2-official/vllm/Flashcomm2OProjRowParallelOp_input_parallel.pt"):
-            torch.save(input_parallel, "/mnt/deepseek/cloudide/yujinqi/issue/flashcomm2-official/vllm/Flashcomm2OProjRowParallelOp_input_parallel.pt")
-            print(f"Flashcomm2OProjRowParallelOp input_parallel SAVED")
         # padding for all-to-all
         forward_context = get_forward_context()
         num_padding_tokens = forward_context.pad_size
@@ -580,10 +576,6 @@ class SequenceRowParallelOp(CustomRowParallelOp):
         assert self.quant_method is not None
         bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
         print(f"SequenceRowParallelOp input_parallel={input_parallel}")
-        import os
-        if get_tp_group().rank_in_group == 0 and not os.path.exists("/mnt/deepseek/cloudide/yujinqi/issue/flashcomm2-official/vllm/SequenceRowParallelOp_input_parallel.pt"):
-            torch.save(input_parallel, "/mnt/deepseek/cloudide/yujinqi/issue/flashcomm2-official/vllm/SequenceRowParallelOp_input_parallel.pt")
-            print(f"SequenceRowParallelOp input_parallel SAVED")
         print(f"SequenceRowParallelOp bias_={bias_}")
 
         if self.tp_size == 1 or not self.reduce_results:
@@ -612,7 +604,7 @@ class SequenceRowParallelOp(CustomRowParallelOp):
 def get_column_parallel_op(
     disable_tp, prefix, layer
 ) -> Tuple[Optional[Union[MLPColumnParallelOp, SequenceMergedColumnParallelOp,
-                          SequenceQKVParallelOp, Flashcomm2MergedColumnParallelOp, Flashcomm2QKVParallelOp]], int, int]:
+                          SequenceQKVParallelOp]], int, int]:
     if disable_tp or ("shared_experts" in prefix
                       and shared_expert_dp_enabled()):
         return None, 0, 1
@@ -621,20 +613,14 @@ def get_column_parallel_op(
         MLPColumnParallelOp,
         SequenceMergedColumnParallelOp,
         SequenceQKVParallelOp,
-        Flashcomm2MergedColumnParallelOp,
-        Flashcomm2QKVParallelOp
     ]] = None
     if "shared_experts" in prefix:
         custom_op = None
     elif "gate_up_proj" in prefix and mlp_tp_enable():
         custom_op = MLPColumnParallelOp(layer)
-    # elif "gate_up_proj" in prefix and flashcomm2_enable():
-    #     custom_op = Flashcomm2MergedColumnParallelOp(layer)
-    elif "gate_up_proj" in prefix and enable_sp():
+    elif "gate_up_proj" in prefix and (enable_sp() or flashcomm2_enable()):
         custom_op = SequenceMergedColumnParallelOp(layer)
-    # elif flashcomm2_enable():
-    #     custom_op = Flashcomm2QKVParallelOp(layer, prefix)
-    elif "qkv_proj" in prefix and enable_sp():
+    elif "qkv_proj" in prefix and (enable_sp() or flashcomm2_enable()):
         custom_op = SequenceQKVParallelOp(layer, prefix)
 
     if custom_op is not None:
