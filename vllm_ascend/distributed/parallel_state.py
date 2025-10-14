@@ -2,7 +2,7 @@ from typing import Optional
 
 import torch
 from vllm.config import ParallelConfig
-from vllm.distributed.parallel_state import (GroupCoordinator, get_world_group, get_tp_group, 
+from vllm.distributed.parallel_state import (GroupCoordinator, get_dp_group, get_world_group, get_tp_group, 
                                              init_model_parallel_group)
 from vllm_ascend.utils import flashcomm2_enable
 
@@ -147,7 +147,7 @@ def init_ascend_model_parallel(parallel_config: ParallelConfig, ):
     if flashcomm2_enable():
         flashcomm2_otp_size = get_ascend_config().flashcomm2_oproj_tensor_parallel_size
         global_tp_size = get_tp_group().world_size
-        global_dp_size = get_tp_group().world_size
+        global_dp_size = get_dp_group().world_size
         num_oproj_tensor_parallel_groups: int = (global_tp_size // flashcomm2_otp_size)
 
         global _FLASHCOMM2_OTP
