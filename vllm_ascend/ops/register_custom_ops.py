@@ -83,7 +83,7 @@ def _maybe_pad_and_reduce_impl(x: torch.Tensor,
     except AssertionError:
         return tensor_model_parallel_all_reduce(x)
 
-    if not forward_context.sp_enabled:
+    if not (forward_context.sp_enabled or forward_context.flashcomm_v2_enabled):
         return tensor_model_parallel_all_reduce(x)
     
     sp_enabled = forward_context.sp_enabled
