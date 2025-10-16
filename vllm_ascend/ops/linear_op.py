@@ -411,7 +411,6 @@ class Flashcomm2OProjRowParallelOp(CustomRowParallelOp):
             Output.shape = [(batchsize*seqlength+padsize)/TP, hiddensize]
         """
         # Handle input parallelism - split or use as-is
-        print(f"Flashcomm2OProjRowParallelOp--input_.shape={input_.shape}")
         if self.input_is_parallel:
             input_parallel = input_
         else:
@@ -420,8 +419,6 @@ class Flashcomm2OProjRowParallelOp(CustomRowParallelOp):
                 input_, num_partitions=self.tp_size)
             input_parallel = splitted_input[tp_rank].contiguous()
 
-        print(f"Flashcomm2OProjRowParallelOp--input_parallel.shape={input_parallel.shape}")
-        print(f"Flashcomm2OProjRowParallelOp--before all2all input_parallel={input_parallel}")
         # padding for all-to-all
         forward_context = get_forward_context()
         num_padding_tokens = forward_context.pad_size
@@ -461,15 +458,12 @@ class Flashcomm2OProjRowParallelOp(CustomRowParallelOp):
             -1                
         ).transpose(0, 1).reshape(chunk_size, -1) 
 
-        print(f"Flashcomm2OProjRowParallelOp--after all2all input_parallel.shape={input_parallel.shape}")
 
         # Matrix multiply.
         assert self.quant_method is not None
         # Only fuse bias add into GEMM for rank 0 (this ensures that
         # bias will not get added more than once in TP>1 case)
         bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
-        print(f"Flashcomm2OProjRowParallelOp--after all2all input_parallel={input_parallel}")
-        print(f"Flashcomm2OProjRowParallelOp--after all2all bias_={bias_}")
     
         output_parallel = self.quant_method.apply(self.layer,
                                                 input_parallel,
@@ -479,15 +473,12 @@ class Flashcomm2OProjRowParallelOp(CustomRowParallelOp):
             # flashcomm2 with reduce-scatter
             output = self.comm_group.reduce_scatter(output_parallel, dim=0)
         else:
-            print(f"Flashcomm2OProjRowParallelOp--self.tp_size==1")
             output = output_parallel
-        print(f"Flashcomm2OProjRowParallelOp--output.shape={output.shape}")
 
         output_bias = self.bias if self.skip_bias_add else None
 
         # if not self.return_bias:
         #     return output
-        print(f"Flashcomm2OProjRowParallelOp--output={output}")
         return output, output_bias
 
     def update_attrs(self):
@@ -564,7 +555,6 @@ class SequenceRowParallelOp(CustomRowParallelOp):
         Implemented multiple optimization projects for dense models, such as FlashComm and
         communication-computation fusion.
         """
-        print(f"SequenceRowParallelOp self.reduce_results={self.reduce_results}")
 
         if self.input_is_parallel:
             input_parallel = input_
@@ -575,24 +565,18 @@ class SequenceRowParallelOp(CustomRowParallelOp):
 
         assert self.quant_method is not None
         bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
-        print(f"SequenceRowParallelOp input_parallel={input_parallel}")
-        print(f"SequenceRowParallelOp bias_={bias_}")
 
         if self.tp_size == 1 or not self.reduce_results:
-            print(f"SequenceRowParallelOp 11111")
             output = self.quant_method.apply(self.layer,
                                              input_parallel,
                                              bias=bias_)
         else:
-            print(f"SequenceRowParallelOp 22222")
             output_parallel = self.quant_method.apply(self.layer,
                                                       input_parallel,
                                                       bias=bias_)
             output = torch.ops.vllm.maybe_pad_and_reduce(output_parallel)
 
-        print(f"SequenceRowParallelOp output.shape={output.shape}")        
         output_bias = self.bias if self.skip_bias_add else None
-        print(f"SequenceRowParallelOp--output={output}")
         return output, output_bias
 
     def update_attrs(self):

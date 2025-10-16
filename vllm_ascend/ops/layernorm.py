@@ -64,8 +64,6 @@ class AscendRMSNorm(RMSNorm):
         import torch_npu
 
         if residual is not None:
-            print(f"AscendRMSNorm--not None--residual.shape={residual.shape}")
-            print(f"AscendRMSNorm--not None--x.shape={x.shape}")
             residual = torch.ops.vllm.maybe_chunk_residual(x, residual)
             assert x.size(0) == residual.size(0)
             x, residual = _addrmsnorm_forward_oot(
@@ -73,8 +71,6 @@ class AscendRMSNorm(RMSNorm):
             return x, residual
         x, residual = torch_npu.npu_rms_norm(x, self.weight,
                                              self.variance_epsilon)
-        print(f"AscendRMSNorm--None--residual.shape={residual.shape}")
-        print(f"AscendRMSNorm--None--x.shape={x.shape}")
         return x
 
     @property
