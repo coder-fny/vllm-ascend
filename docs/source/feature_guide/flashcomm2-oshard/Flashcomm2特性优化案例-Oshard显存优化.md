@@ -23,3 +23,20 @@ NZ格式问题，导致All-gather后，无法和源tensor对齐
 •设置冗余层，通信计算完全掩盖
 
 ![image-20251111174441436](Flashcomm2特性优化案例-Oshard显存优化.assets/image-20251111174441436.png)
+
+## 收益
+
+- P节点性能收益
+  - flashcomm2性能收益
+  - flashcomm2+Oshard性能收益
+
+![image-20251112180159131](Flashcomm2特性优化案例-Oshard显存优化.assets/image-20251112180159131.png)
+
+- 显存收益，以deepseekR1-w8a8，TP16DP1为例
+
+  deepseekR1模型61层权重总大小为61
+
+  - 基线显存占用
+  - flashcomm2显存占用
+  - flashcomm2+Oshard显存占用
+
