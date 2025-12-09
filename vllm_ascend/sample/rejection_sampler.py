@@ -7,7 +7,6 @@ import vllm.v1.sample.rejection_sampler as rs
 from vllm.triton_utils import HAS_TRITON, tl, triton
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.rejection_sampler import (RejectionSampler,
-                                              apply_sampling_constraints,
                                               generate_uniform_probs)
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 
