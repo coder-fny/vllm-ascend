@@ -1174,23 +1174,23 @@ void MoeInitRountingCustomTilingBase::Tiling4SrcToDstCompute()
     // ubsize减去32B对齐保留空间
     int64_t remainUbSize = aicoreParams_.ubSize - ASSIST_NUM * sizeof(int32_t) - ONE_BLOCK_BYTE * (ASSIST_NUM + 1);
     int64_t perLoopMaxElements = remainUbSize / (ONE_BLOCK_BYTE + SIZE_INT32);
-    int64_t perCoreElements = Ops::Base::CeilDiv(totalLength_, useCore);
+    int64_t perCoreElements = CeilDiv(totalLength_, useCore);
     if (perCoreElements <= 0) {
         tilingData->set_needCoreNum(0);
         return;
     }
-    int64_t needCoreNum = Ops::Base::CeilDiv(totalLength_, perCoreElements);
+    int64_t needCoreNum = CeilDiv(totalLength_, perCoreElements);
     tilingData->set_needCoreNum(needCoreNum);
     int64_t lastCoreElements = totalLength_ - perCoreElements * (needCoreNum - 1);
 
     tilingData->set_perCoreElements(perCoreElements);
     tilingData->set_lastCoreElements(lastCoreElements);
-    int64_t perCoreLoops = Ops::Base::CeilDiv(perCoreElements, perLoopMaxElements);
-    int64_t perCorePerLoopElements = Ops::Base::CeilDiv(perCoreElements, perCoreLoops);
+    int64_t perCoreLoops = CeilDiv(perCoreElements, perLoopMaxElements);
+    int64_t perCorePerLoopElements = CeilDiv(perCoreElements, perCoreLoops);
     int64_t perCoreLastLoopElements = perCoreElements - (perCoreLoops - 1) * perCorePerLoopElements;
 
-    int64_t lastCoreLoops = Ops::Base::CeilDiv(lastCoreElements, perLoopMaxElements);
-    int64_t lastCorePerLoopElements = Ops::Base::CeilDiv(lastCoreElements, lastCoreLoops);
+    int64_t lastCoreLoops = CeilDiv(lastCoreElements, perLoopMaxElements);
+    int64_t lastCorePerLoopElements = CeilDiv(lastCoreElements, lastCoreLoops);
     int64_t lastCoreLastLoopElements = lastCoreElements - (lastCoreLoops - 1) * lastCorePerLoopElements;
 
     tilingData->set_perCoreLoops(perCoreLoops);
