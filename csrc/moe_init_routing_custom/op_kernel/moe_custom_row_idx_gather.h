@@ -48,22 +48,18 @@ private:
     TQue<QuePosition::VECOUT, 1> copyOutQueue_;
     TBuf<TPosition::VECCALC> assistBuffer_;
 
-    const MoeCustomExpertTokensCountTilingData *expertTokensCountTilingData_;
+    const MoeCustomSrcToDstComputeTilingData *srcToDstComputeTilingData_;
     int64_t blockIdx_;
     int64_t needCoreNum_;
     int64_t perCoreElements_;
-    int64_t curCoreElements_ = 0;
     int64_t actualExpertNum_ = 0;
     int64_t ep_ = 0;
     int64_t rowIdxType_ = 0;
-    int64_t coreNum_ = 0;
     int64_t expertTotalCount_ = 0;
 
     int64_t loops_ = 0;
     int64_t perLoopElements_ = 0;
     int64_t lastLoopElements_ = 0;
-
-    int64_t perCoreElements;
 };
 
 __aicore__ inline void RowIdxGather::AssistInit()
@@ -71,28 +67,20 @@ __aicore__ inline void RowIdxGather::AssistInit()
     LocalTensor<int32_t> assistTensor = assistBuffer_.Get<int32_t>(ASSIST_NUM);
     DataCopy(assistTensor, assistGm_, ASSIST_NUM);
     SetWaitFlag<HardEvent::MTE2_V>(HardEvent::MTE2_V);
-    Adds(assistTensor, assistTensor, (int32_t)(blockIdx_ * perCoreElements), ASSIST_NUM);
+    Adds(assistTensor, assistTensor, (int32_t)(blockIdx_ * perCoreElements_), ASSIST_NUM);
 }
 
 __aicore__ inline void RowIdxGather::Init(GM_ADDR expandedRowIdx, GM_ADDR workspace,
                                           const MoeInitRoutingCustomTilingData *tilingData, TPipe *tPipe)
 {
     pipe_ = tPipe;
-    expertTokensCountTilingData_ = &(tilingData->expertTokensCountTilingDataOp);
+    srcToDstComputeTilingData_ = &(tilingData->srcToDstComputeParamsOp);
     blockIdx_ = GetBlockIdx();
-    coreNum_ = tilingData->coreNum;
-    needCoreNum_ = expertTokensCountTilingData_->needCoreNum;
-    perCoreElements_ = expertTokensCountTilingData_->perCoreElements;
     actualExpertNum_ = tilingData->actualExpertNum;
     ep_ = tilingData->ep;
     rowIdxType_ = tilingData->rowIdxType;
 
     expandedRowIdxGm_.SetGlobalBuffer((__gm__ int32_t *)expandedRowIdx, actualExpertNum_);
-    if (blockIdx_ < needCoreNum_ - 1) {
-        curCoreElements_ = perCoreElements_;
-    } else if (blockIdx_ == needCoreNum_ - 1) {
-        curCoreElements_ = expertTokensCountTilingData_->lastCoreElements;
-    }
 
     if (ep_) {
         expertTotalCountGm_.SetGlobalBuffer((__gm__ int32_t *)workspace +
@@ -101,19 +89,20 @@ __aicore__ inline void RowIdxGather::Init(GM_ADDR expandedRowIdx, GM_ADDR worksp
                                             actualExpertNum_);
         AscendC::DataCacheCleanAndInvalid<int32_t, AscendC::CacheLine::SINGLE_CACHE_LINE, AscendC::DcciDst::CACHELINE_OUT>(
             expertTotalCountGm_);
-        expertTotalCount_ = expertTotalCountGm_.GetValue(0);}
-    else {
+        expertTotalCount_ = expertTotalCountGm_.GetValue(0);
+    } else {
         expertTotalCount_ = tilingData->n * tilingData->k;
     }
     assistGm_.SetGlobalBuffer((__gm__ int32_t*)assist, ASSIST_NUM);
-    perCoreElements = Ceil(expertTotalCount_, needCoreNum_);
-    needCoreNum_ = Ceil(expertTotalCount_, perCoreElements);
-    int64_t lastCoreElements = expertTotalCount_ - (needCoreNum_ - 1) * perCoreElements;
-    int64_t perCoreLoops = Ceil(perCoreElements, expertTokensCountTilingData_->perCorePerLoopElements);
-    int64_t perCorePerLoopElements = Ceil(perCoreElements, perCoreLoops);
-    int64_t perCoreLastLoopElements = perCoreElements - (perCoreLoops - 1) * perCorePerLoopElements;
+    perCoreElements_ = Ceil(expertTotalCount_, srcToDstComputeTilingData_->needCoreNum);
+    needCoreNum_ = Ceil(expertTotalCount_, perCoreElements_);
 
-    int64_t lastCoreLoops = Ceil(lastCoreElements, expertTokensCountTilingData_->perCorePerLoopElements);
+    int64_t lastCoreElements = expertTotalCount_ - (needCoreNum_ - 1) * perCoreElements_;
+    int64_t perCoreLoops = Ceil(perCoreElements_, srcToDstComputeTilingData_->perCorePerLoopElements);
+    int64_t perCorePerLoopElements = Ceil(perCoreElements_, perCoreLoops);
+    int64_t perCoreLastLoopElements = perCoreElements_ - (perCoreLoops - 1) * perCorePerLoopElements;
+
+    int64_t lastCoreLoops = Ceil(lastCoreElements, srcToDstComputeTilingData_->perCorePerLoopElements);
     int64_t lastCorePerLoopElements = Ceil(lastCoreElements, lastCoreLoops);
     int64_t lastCoreLastLoopELements = lastCoreElements - (lastCoreLoops - 1) * lastCorePerLoopElements;
 
@@ -129,11 +118,11 @@ __aicore__ inline void RowIdxGather::Init(GM_ADDR expandedRowIdx, GM_ADDR worksp
     }
 
     if (rowIdxType_ == SCATTER) {
-        sortedExpertIndicesGm_.SetGlobalBuffer((__gm__ int32_t *)expandedRowIdx + blockIdx_ * perCoreElements, actualExpertNum_);
+        sortedExpertIndicesGm_.SetGlobalBuffer((__gm__ int32_t *)expandedRowIdx + blockIdx_ * perCoreElements_, actualExpertNum_);
     } else {
         sortedExpertIndicesGm_.SetGlobalBuffer((__gm__ int32_t *)workspace +
                                                Align(tilingData->n * tilingData->k, sizeof(int32_t)) +
-                                               blockIdx_ * perCoreElements,
+                                               blockIdx_ * perCoreElements_,
                                            actualExpertNum_);
     }
 
@@ -148,9 +137,9 @@ __aicore__ inline void RowIdxGather::Init(GM_ADDR expandedRowIdx, GM_ADDR worksp
 
 __aicore__ inline void RowIdxGather::Process()
 {
-    if (ep_ == 1 && rowIdxType_ == SCATTER){
+    if (ep_ == 1 && rowIdxType_ == SCATTER) {
         return;
-    } else{
+    } else {
         if (blockIdx_ < needCoreNum_) {
             AssistInit();
             for (int64_t loop = 0; loop < loops_; loop++) {

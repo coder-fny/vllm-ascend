@@ -89,6 +89,19 @@ TILING_DATA_FIELD_DEF(int64_t, colLoops);
 END_TILING_DATA_DEF;
 REGISTER_TILING_DATA_CLASS(MoeCustomSrcToDstCapacityComputeTilingDataOp, MoeCustomSrcToDstCapacityComputeTilingData)
 
+BEGIN_TILING_DATA_DEF(MoeCustomSrcToDstComputeTilingData)
+TILING_DATA_FIELD_DEF(int64_t, needCoreNum);
+TILING_DATA_FIELD_DEF(int64_t, perCoreElements);
+TILING_DATA_FIELD_DEF(int64_t, perCorePerLoopElements);
+TILING_DATA_FIELD_DEF(int64_t, perCoreLastLoopElements);
+TILING_DATA_FIELD_DEF(int64_t, lastCoreElements);
+TILING_DATA_FIELD_DEF(int64_t, lastCorePerLoopElements);
+TILING_DATA_FIELD_DEF(int64_t, lastCoreLastLoopElements);
+TILING_DATA_FIELD_DEF(int64_t, perCoreLoops);
+TILING_DATA_FIELD_DEF(int64_t, lastCoreLoops)
+END_TILING_DATA_DEF;
+REGISTER_TILING_DATA_CLASS(MoeCustomSrcToDstComputeTilingDataOp, MoeCustomSrcToDstComputeTilingData)
+
 BEGIN_TILING_DATA_DEF(MoeInitRoutingCustomTilingData)
 TILING_DATA_FIELD_DEF(int64_t, coreNum);
 TILING_DATA_FIELD_DEF(int64_t, n);
@@ -118,6 +131,7 @@ TILING_DATA_FIELD_DEF_STRUCT(MoeCustomExpertTokensCountTilingData, expertTokensC
 TILING_DATA_FIELD_DEF_STRUCT(MoeCustomGatherOutComputeTilingData, gatherOutComputeParamsOp);
 TILING_DATA_FIELD_DEF_STRUCT(MoeCustomSrcToDstCapacityComputeTilingData, srcToDstDropPadParamsOp);
 TILING_DATA_FIELD_DEF_STRUCT(MoeCustomSrcToDstCapacityComputeTilingData, srcToDstDropPadDynamicParamsOp);
+TILING_DATA_FIELD_DEF_STRUCT(MoeCustomSrcToDstComputeTilingData, srcToDstComputeParamsOp);
 END_TILING_DATA_DEF;
 REGISTER_TILING_DATA_CLASS(MoeInitRoutingCustom, MoeInitRoutingCustomTilingData)
 struct MoeInitRoutingCustomCompileInfo {
