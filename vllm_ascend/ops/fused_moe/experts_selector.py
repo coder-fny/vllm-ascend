@@ -220,15 +220,12 @@ def _select_experts_with_fusion_ops(
         k_group=topk_group,
         group_count=num_expert_group,
         group_select_mode=1,  # 0: the maximum in the group; 1: topk2.sum(fix)
-        renorm=0,  # 0: softmax->topk(fix); 1: topk->softmax
+        renorm=1,  # 0: softmax->topk(fix); 1: topk->softmax
         norm_type=norm_type,  # 0: softmax; 1: sigmoid
         # out_flag=False, # todo new api; should the third output be output
         # y2_flag=False, # old api; should the third output be output
         routed_scaling_factor=1,
         eps=float(1e-20))
-    if scoring_func == "softmax":
-        topk_weights = _renormalize_topk_weights(topk_weights, renormalize)
-
     return topk_weights, topk_ids
 
 
