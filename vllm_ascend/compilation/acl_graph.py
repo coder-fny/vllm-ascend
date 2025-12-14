@@ -20,6 +20,7 @@ from vllm.logger import logger
 from vllm.platforms import current_platform
 
 from ..utils import weak_ref_tensors
+import vllm_ascend.envs as envs_ascend
 
 
 @dataclasses.dataclass
@@ -214,23 +215,42 @@ def update_attn_params(update_stream, forward_context, runtime_shape):
             query_start_loc = forward_context.attn_metadata[
                 key].query_start_loc_list
             torch.npu.graph_task_update_begin(update_stream, handle)
-            torch_npu.npu_fused_infer_attention_score.out(
-                query=query,
-                key=key_cache,
-                value=value,
-                block_table=block_tables,
-                atten_mask=attn_mask,
-                input_layout="TND",
-                block_size=block_size,
-                actual_seq_lengths=query_start_loc,
-                actual_seq_lengths_kv=seq_lens,
-                num_key_value_heads=num_kv_heads,
-                num_heads=num_heads,
-                scale=scale,
-                sparse_mode=3,
-                workspace=graph_params.workspaces.get(runtime_shape),
-                out=[attn_output, softmax_lse],
-            )
+            if envs_ascend.VLLM_ASCEND_ENABLE_FIA_BNSD:
+                torch_npu.npu_fused_infer_attention_score.out(
+                    query=query,
+                    key=key_cache,
+                    value=value,
+                    block_table=block_tables,
+                    atten_mask=None,
+                    input_layout="BNSD",
+                    block_size=block_size,
+                    actual_seq_lengths=query_start_loc,
+                    actual_seq_lengths_kv=seq_lens,
+                    num_key_value_heads=num_kv_heads,
+                    num_heads=num_heads,
+                    scale=scale,
+                    sparse_mode=0,
+                    workspace=graph_params.workspaces.get(runtime_shape),
+                    out=[attn_output, softmax_lse],
+                )
+            else:    
+                torch_npu.npu_fused_infer_attention_score.out(
+                    query=query,
+                    key=key_cache,
+                    value=value,
+                    block_table=block_tables,
+                    atten_mask=attn_mask,
+                    input_layout="TND",
+                    block_size=block_size,
+                    actual_seq_lengths=query_start_loc,
+                    actual_seq_lengths_kv=seq_lens,
+                    num_key_value_heads=num_kv_heads,
+                    num_heads=num_heads,
+                    scale=scale,
+                    sparse_mode=3,
+                    workspace=graph_params.workspaces.get(runtime_shape),
+                    out=[attn_output, softmax_lse],
+                )
             torch.npu.graph_task_update_end(update_stream)
 
             event.record(update_stream)

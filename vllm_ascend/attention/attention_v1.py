@@ -39,6 +39,7 @@ from vllm_ascend.compilation.acl_graph import (get_graph_params,
                                                update_graph_params_workspaces)
 from vllm_ascend.utils import weak_ref_tensors
 
+import vllm_ascend.envs as envs_ascend
 
 @register_backend(AttentionBackendEnum.CUSTOM, "ASCEND")
 class AscendAttentionBackend(AttentionBackend):
@@ -404,10 +405,16 @@ class AscendAttentionBackendImpl(AttentionImpl):
             actual_seq_lengths_kv = attn_metadata.seq_lens_list
         elif attn_metadata.attn_state == AscendAttentionState.DecodeOnly:
             num_block, block_size, _, _ = self.key_cache.shape  # type: ignore
-            key = self.key_cache.view(  # type: ignore
-                num_block, block_size, -1)
-            value = self.value_cache.view(  # type: ignore
-                num_block, block_size, -1)
+            if envs_ascend.VLLM_ASCEND_ENABLE_FIA_BNSD:
+                query = query.view(-1, self.num_heads, 1, self.head_size).transpose(0, 2)
+                key = self.key_cache.view(-1,block_size, self.num_kv_heads, self.head_size)
+                value = self.value_cache.view(-1, block_size, self.num_kv_heads, self.head_size)
+                output = output.view(-1, self.num_heads, 1, self.head_size).transpose(0, 2)
+            else:
+                key = self.key_cache.view(  # type: ignore
+                    num_block, block_size, -1)
+                value = self.value_cache.view(  # type: ignore
+                    num_block, block_size, -1)
             block_table = attn_metadata.block_tables
             actual_seq_lengths_kv = attn_metadata.seq_lens_list
         # Normal V1 situation.
@@ -430,21 +437,38 @@ class AscendAttentionBackendImpl(AttentionImpl):
         workspace = graph_params.workspaces.get(num_tokens)
         softmax_lse = torch.empty(1, dtype=query.dtype, device=query.device)
         if workspace is None:
-            workspace = torch_npu._npu_fused_infer_attention_score_get_max_workspace(
-                query=query,
-                key=key,
-                value=value,
-                atten_mask=attn_metadata.attn_mask,
-                block_table=block_table,
-                input_layout="TND",
-                block_size=block_size,
-                actual_seq_lengths=query_start_loc,
-                actual_seq_lengths_kv=actual_seq_lengths_kv,
-                num_key_value_heads=self.num_kv_heads,
-                num_heads=self.num_heads,
-                sparse_mode=3,
-                scale=self.scale,
-            )
+            if envs_ascend.VLLM_ASCEND_ENABLE_FIA_BNSD:
+                workspace = torch_npu._npu_fused_infer_attention_score_get_max_workspace(
+                    query=query,
+                    key=key,
+                    value=value,
+                    block_table=block_table,
+                    input_layout="BNSD",
+                    block_size=block_size,
+                    actual_seq_lengths=query_start_loc,
+                    actual_seq_lengths_kv=actual_seq_lengths_kv,
+                    num_key_value_heads=self.num_kv_heads,
+                    num_heads=self.num_heads,
+                    scale=self.scale,
+                    atten_mask=None,
+                    sparse_mode=0,
+                )
+            else:
+                workspace = torch_npu._npu_fused_infer_attention_score_get_max_workspace(
+                    query=query,
+                    key=key,
+                    value=value,
+                    atten_mask=attn_metadata.attn_mask,
+                    block_table=block_table,
+                    input_layout="TND",
+                    block_size=block_size,
+                    actual_seq_lengths=query_start_loc,
+                    actual_seq_lengths_kv=actual_seq_lengths_kv,
+                    num_key_value_heads=self.num_kv_heads,
+                    num_heads=self.num_heads,
+                    sparse_mode=3,
+                    scale=self.scale,
+                )
             update_graph_params_workspaces(num_tokens, workspace)
 
         # Handle graph capturing mode
@@ -463,23 +487,42 @@ class AscendAttentionBackendImpl(AttentionImpl):
              weak_ref_tensors(softmax_lse)))
 
         torch.npu.graph_task_group_begin(stream)
-        torch_npu.npu_fused_infer_attention_score.out(
-            query=query,
-            key=key,
-            value=value,
-            atten_mask=attn_metadata.attn_mask,
-            block_table=block_table,
-            input_layout="TND",
-            block_size=block_size,
-            actual_seq_lengths=query_start_loc,
-            actual_seq_lengths_kv=actual_seq_lengths_kv,
-            num_key_value_heads=self.num_kv_heads,
-            num_heads=self.num_heads,
-            scale=self.scale,
-            sparse_mode=3,
-            workspace=workspace,
-            out=[output, softmax_lse],
-        )
+        if envs_ascend.VLLM_ASCEND_ENABLE_FIA_BNSD:
+            torch_npu.npu_fused_infer_attention_score.out(
+                query=query,
+                key=key,
+                value=value,
+                atten_mask=None,
+                block_table=block_table,
+                input_layout="BNSD",
+                block_size=block_size,
+                actual_seq_lengths=query_start_loc,
+                actual_seq_lengths_kv=actual_seq_lengths_kv,
+                num_key_value_heads=self.num_kv_heads,
+                num_heads=self.num_heads,
+                scale=self.scale,
+                sparse_mode=0,
+                workspace=workspace,
+                out=[output, softmax_lse],
+            )
+        else:    
+            torch_npu.npu_fused_infer_attention_score.out(
+                query=query,
+                key=key,
+                value=value,
+                atten_mask=attn_metadata.attn_mask,
+                block_table=block_table,
+                input_layout="TND",
+                block_size=block_size,
+                actual_seq_lengths=query_start_loc,
+                actual_seq_lengths_kv=actual_seq_lengths_kv,
+                num_key_value_heads=self.num_kv_heads,
+                num_heads=self.num_heads,
+                scale=self.scale,
+                sparse_mode=3,
+                workspace=workspace,
+                out=[output, softmax_lse],
+            )
 
         output = output.view(num_tokens, self.num_heads, self.head_size)
 
