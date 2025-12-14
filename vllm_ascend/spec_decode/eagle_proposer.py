@@ -87,15 +87,15 @@ class EagleProposer(Proposer):
             device=device)
         self.max_num_tokens = (
             vllm_config.scheduler_config.max_num_batched_tokens)
-        self.token_arange_np = np.arange(self.max_num_tokens)
+        max_num_slots_for_arange = max(self.max_num_tokens, max_batch_size + 1)
+        self.token_arange_np = np.arange(max_num_slots_for_arange)
         # We need +1 here because the arange is used to set query_start_loc,
         # which has one more element than batch_size.
-        self.arange = torch.arange(vllm_config.scheduler_config.max_num_seqs +
-                                   1,
+        self.arange = torch.arange(max_num_slots_for_arange,
                                    device=device,
                                    dtype=torch.int32)
         self.arange_cpu = torch.arange(
-            vllm_config.scheduler_config.max_num_seqs + 1,
+            max_num_slots_for_arange,
             device="cpu",
             dtype=torch.int32)
         self.attn_mask_builder = AttentionMaskBuilder(self.device)
