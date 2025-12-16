@@ -37,9 +37,9 @@ from vllm_ascend.attention.utils import (AscendCommonAttentionMetadata,
                                          split_decodes_and_prefills)
 from vllm_ascend.compilation.acl_graph import (get_graph_params,
                                                update_graph_params_workspaces)
+from vllm_ascend.ops.utils import flashcomm2_oshard_manager
 from vllm_ascend.utils import (AscendDeviceType, flashcomm2_o_shared_enabled,
                                get_ascend_device_type, weak_ref_tensors)
-from vllm_ascend.ops.utils import flashcomm2_oshard_manager
 
 
 @register_backend(AttentionBackendEnum.CUSTOM, "ASCEND")
