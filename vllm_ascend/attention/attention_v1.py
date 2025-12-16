@@ -553,6 +553,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
             num_heads=self.num_heads,
             scale=self.scale,
             sparse_mode=3,
+            softmax_lse_flag=True
         )
 
         attn_output = attn_output.view(num_tokens, self.num_heads,
