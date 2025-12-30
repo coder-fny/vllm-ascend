@@ -57,7 +57,7 @@ from vllm.forward_context import get_forward_context
 
 from vllm_ascend import envs as envs_ascend
 from vllm_ascend.ascend_config import get_ascend_config
-from vllm_ascend.distributed.parallel_state import (get_flashcomm2_odp_group,
+from vllm_ascend.distributed.parallel_state import (get_current_vllm_config, get_flashcomm2_odp_group,
                                                     get_flashcomm2_otp_group,
                                                     get_mlp_tp_group,
                                                     get_otp_group)
@@ -696,6 +696,10 @@ def _get_column_parallel_op(
     prefix, layer
 ) -> Optional[Union[MLPColumnParallelOp, SequenceColumnParallelOp,
                     ShardedCPColumnParallelOp, Flashcomm2OshardQKVParallelOp]]:
+    vllm_config = get_current_vllm_config()
+    model_type = vllm_config.model_config.hf_config.model_type
+    if model_type == "qwen2_5_vl" and "visual.blocks" in prefix:
+        return None
     if enable_dsa_cp() and ("q_b_proj" in prefix or "kv_b_proj" in prefix):
         return ShardedCPColumnParallelOp(layer)
     if "gate_up_proj" in prefix and mlp_tp_enable(
@@ -726,6 +730,10 @@ def _get_row_parallel_op(
 ) -> Optional[Union[MLPRowParallelOp, OProjRowParallelOp,
                     Flashcomm2OProjRowParallelOp, MatmulAllreduceRowParallelOp,
                     SequenceRowParallelOp, ShardedCPRowParallelOp]]:
+    vllm_config = get_current_vllm_config()
+    model_type = vllm_config.model_config.hf_config.model_type
+    if model_type == "qwen2_5_vl" and "visual.blocks" in prefix:
+        return None
     if enable_dsa_cp() and "o_proj" in prefix:
         return ShardedCPRowParallelOp(layer)
     if "down_proj" in prefix and mlp_tp_enable() and not is_moe_layer(prefix):
